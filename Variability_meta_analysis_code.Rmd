@@ -1,0 +1,2881 @@
+---
+title: "'Variability in meta-analysis estimates of continuous outcomes using different standardization and scale-specific re-expression methods: R code"
+author: "Gallardo-Gómez, D."
+date: '2023-09-27'
+output: html_document
+---
+
+
+Load the required libraries
+
+```{r, message=FALSE, warning=FALSE, error=FALSE, results='hide'}
+library(tidyverse)
+library(tidybayes)
+library(brms)
+library(readxl)
+library(ggthemes)
+library(ggsci)
+library(cowplot)
+library(MBNMAdose)
+library(kableExtra)
+library(ggdist)
+library(patchwork)
+library(ggmcmc)
+library(ggridges)
+library(modelr)
+library(marginaleffects)
+library(glue)
+library(ggpubr)
+```
+
+```{r}
+# Function to compute Deviance Information Criteria [DIC] parameters
+dic_brmsfit <- function(object) {
+  Dbar <- -2 * mean(rowSums(log_lik(object)))
+  coef_pmean <- unname(fixef(object)[ , "Estimate"])
+  res <- residuals(object)[ , "Estimate"]
+  N <- length(res)
+  sigma <- posterior_summary(object, variable = "sigma")[ , "Estimate"]
+  Dhat <- -2 * sum(dnorm(res, sd = sigma, log = TRUE))
+  p <- Dbar - Dhat
+  elpd <- Dhat / -2 - p
+  data.frame(elpd_dic = elpd, p_dic = p, dic = Dhat + 2 * p, 
+             row.names = "Estimate")
+}
+```
+
+
+Load our dataset and check it.
+
+```{r, echo=FALSE}
+data <- read_xlsx(path = "", # fill with the path where you save the dataset in Excel format
+                  col_names = TRUE, na = "NA", sheet = "multinma")
+
+# we should change the direction of the effect measures that indicated an outcome improvement with a mean reduction post-value
+data <- data %>%
+  mutate(y_int = ifelse(lower_better == "yes", y_int * -1, y_int),
+         y_ext = ifelse(lower_better == "yes", y_ext * -1, y_ext))
+
+# outcomes view
+data %>%
+  group_by(measure) %>%
+  summarise(n = n()) %>%
+  arrange(desc(n))
+
+# view our dataset
+glimpse(data)
+```
+
+
+We are going to subset our dataset to create different databases referring each one to a specific outcome of interest. For the subsequent analysis, we're going to select the Short Physical Performance Battery (`SPPB`), which basically assesses the physical capacity of the patient, and the Barthel Index (`BI`), which measures the ability to carry out the activities of daily-living.
+
+```{r}
+# SPPB data
+sppb_data <- data %>%
+  filter(measure == "SPPB" & !diff == is.na(diff)) %>%
+  mutate(class = factor(class, levels = c("Usual care",
+                                          "Physical activity")))
+
+# BI data
+bi_data <- data %>%
+  filter(measure == "BI" & !diff == is.na(diff)) %>%
+  mutate(class = factor(class, levels = c("Usual care",
+                                          "Physical activity")))
+
+
+# inspecting the range of SD values
+data.frame(scale = c("SPPB", "BI"),
+           n_studies = c(nrow(sppb_data), nrow(bi_data)),
+           pre_SD = c(paste("From", round(range(sppb_data$pre_sd_pooled)[1], 2), "to", round(range(sppb_data$pre_sd_pooled)[2], 2)), paste("From", round(range(bi_data$pre_sd_pooled)[1], 2), "to", round(range(bi_data$pre_sd_pooled)[2]))),
+           post_SD = c(paste("From", round(range(sppb_data$post_sd_pooled)[1], 2), "to", round(range(sppb_data$post_sd_pooled)[2], 2)), paste("From", round(range(bi_data$post_sd_pooled)[1], 2), "to", round(range(bi_data$post_sd_pooled)[2]))),
+           internal_SD = c(mean(sppb_data$pre_sd_pooled), mean(bi_data$pre_sd_pooled))) %>%
+  mutate_if(is.numeric, round, 2)
+```
+  
+  
+## Fitting our meta-analysis models 
+
+The main objective of this work is to compare how different standardization methods could impact in the posterior distribution of some important meta-analytic parameters such as the between-study heterogeneity, pooled mean difference, and posterior expectation of individual studies effects.
+
+To transform back the standardised mean differences, we specify the SD references that we used.
+
+```{r}
+# external SD reference used for standardization
+sppb_external_sd <- 3.14
+
+# internal SD reference used for standardization
+sppb_internal_sd <- sum(sppb_data$pre_sd_pooled) / nrow(sppb_data)
+
+# internal SD reference used for standardization
+sppb_internal_sd_post <- sum(sppb_data$post_sd_pooled) / nrow(sppb_data)
+
+## weighted internal SD reference
+sppb_weighted_ref <- 2.484051
+```
+
+
+
+### Prior distributions specification
+
+```{r}
+# naive prior information
+vague_priors <- c(prior(normal(0, 100), class = Intercept),
+                  prior(normal(0, 10), class = sd)) # 95% of the prior density lies between 0 and 19.6
+```
+
+
+#### Bit of data wrangling
+
+```{r}
+sppb_data <- sppb_data %>%
+               mutate(studyID = case_when(
+                 studyID == "Martinez-Velilla, 2019" ~ "Martinez-Velilla1",
+                 studyID == "Martinez-Velilla, 2021" ~ "Martinez-Velilla2",
+                 studyID == "Martinez-Velilla, 2022" ~ "Martinez-Velilla3",
+                 studyID == "Campo, 2019" ~ "Campo, 2019",
+                 studyID == "Kitzman, 2021" ~ "Kitzman, 2021",
+                 studyID == "Ortiz-Alonso, 2020" ~ "Ortiz-Alonso, 2020",
+                 studyID == "Casas-Herrero, 2022" ~ "Casas-Herrero, 2022"
+               ),
+               diff_w = diff / sppb_weighted_ref,
+         se_diff_w = se_diff / sppb_weighted_ref)
+```
+
+
+### Fitting the models
+
+```{r, results='hide', message=FALSE, warning=FALSE, error=FALSE}
+# for reproducibility sake
+set.seed(28032023)
+
+# multilevel random-intercept meta-analysis using MD 
+model <- brm(diff | se(se_diff, sigma = TRUE) ~ 1 + (1 | studyID),
+             data = sppb_data,
+             family = gaussian(),
+             prior = vague_priors,
+             control = list(adapt_delta = 0.99),
+             iter = 4000, warmup = 1000)
+
+# multilevel random-intercept meta-analysis using SMDs rescaled using an external SD reference 
+model_ext <- brm(diff_ext | se(se_diff_ext, sigma = TRUE) ~ 1 + (1 | studyID),
+             data = sppb_data,
+             family = gaussian(),
+             prior = vague_priors,
+             control = list(adapt_delta = 0.99),
+             iter = 4000, warmup = 1000)
+
+# multilevel random-intercept meta-analysis using SMDs rescaled using an internal SD reference 
+model_int <- brm(diff_int | se(se_diff_int, sigma = TRUE) ~ 1 + (1 | studyID),
+             data = sppb_data,
+             family = gaussian(),
+             prior = vague_priors,
+             control = list(adapt_delta = 0.99),
+             iter = 4000, warmup = 1000)
+
+# multilevel random-intercept meta-analysis using SMDs rescaled using the pooled SD of each study
+model_pre <- brm(diff_pre | se(se_diff_pre, sigma = TRUE) ~ 1 + (1 | studyID),
+             data = sppb_data,
+             family = gaussian(),
+             prior = vague_priors,
+             control = list(adapt_delta = 0.99),
+             iter = 4000, warmup = 1000)
+
+# multilevel random-intercept meta-analysis using SMDs rescaled using the pooled SD of each study
+model_post <- brm(diff_post | se(se_diff_post, sigma = TRUE) ~ 1 + (1 | studyID),
+             data = sppb_data,
+             family = gaussian(),
+             prior = vague_priors,
+             control = list(adapt_delta = 0.99),
+             iter = 4000, warmup = 1000)
+
+# multilevel random-intercept meta-anlaysis using SMDs rescaled using the weighted internal SD reference
+model_w <- brm(diff_w | se(se_diff_w, sigma = TRUE) ~ 1 + (1 | studyID),
+             data = sppb_data,
+             family = gaussian(),
+             prior = vague_priors,
+             control = list(adapt_delta = 0.99),
+             iter = 4000, warmup = 1000)
+
+```
+
+
+### Model fit comparison
+
+```{r}
+# model fit comparison by DIC parameter
+dic_brmsfit(model) %>% 
+  rbind(dic_brmsfit(model_ext)) %>%
+  rbind(dic_brmsfit(model_int)) %>%
+  rbind(dic_brmsfit(model_pre)) %>%
+  rbind(dic_brmsfit(model_post)) %>%
+  as_tibble() %>%
+  mutate(model = c("MD",
+                   "External SD",
+                   "Internal SD",
+                   "Pre pooled study-specific SD",
+                   "Post pooled study-specific SD")) %>%
+  select(model, dic) %>%
+  arrange(dic)
+```
+
+
+#### Convergence analysis
+
+First, let's check if our model reached the convergence. We first check the mixing of the Markov Chain Monte-Carlo simulations, and we then observe the Potential Scale Reduction Factor ($\hat{R}$ parameter) which should be smaller than 1.05.
+
+```{r}
+# good mixing of our predictive chains
+plot(model)
+
+# posterior predictive check
+pp_plot <- pp_check(model, ndraws = 50)
+pp_plot.1 <- pp_check(model_pre, ndraws = 50)
+pp_plot.2 <- pp_check(model_post, ndraws = 50)
+pp_plot.3 <- pp_check(model_int, ndraws = 50)
+pp_plot.4 <- pp_check(model_ext, ndraws = 50)
+
+# observed Rhat value below 1.05
+summary(model)
+```
+
+
+### SMD estimates and back transformation using corresponding SDs
+
+In practice, people use the corresponding SD for standardization to unstandardize the pooled SMD estimate into scale-specific unit.
+
+```{r}
+# extract the posterior draws of the models
+## observed mean differences
+draws <- posterior_samples(model, c("^b", "^sd")) %>%
+  mutate(type = "Pooled MD")
+
+## mean differences rescaled using an external SD reference
+draws_ext <- posterior_samples(model_ext, c("^b", "^sd")) %>%
+  mutate(type = "External SD")
+
+## mean differences rescaled using an internal SD reference
+draws_int <- posterior_samples(model_int, c("^b", "^sd")) %>%
+  mutate(type = "Internal SD")
+
+## mean differences rescaled using the pooled SD of each study
+draws_pre <- posterior_samples(model_pre, c("^b", "^sd")) %>%
+  mutate(type = "Study-specific pooled SD\n(at pre-intervention)")
+
+## mean differences rescaled using the pooled SD of each study
+draws_post <- posterior_samples(model_post, c("^b", "^sd")) %>%
+  mutate(type = "Study-specific pooled SD\n(at post-intervention)")
+
+## mean differences rescaled using the weighted internal SD reference
+draws.w <- posterior_samples(model_w, c("^b", "^sd")) %>%
+  mutate(type = "Weighted internal SD")
+
+
+# change the variables' names for simplicity sake
+names(draws) <- c("intercept", "tau", "type")
+
+names(draws_ext) <- c("intercept", "tau", "type")
+
+names(draws_int) <- c("intercept", "tau", "type")
+
+names(draws_pre) <- c("intercept", "tau", "type")
+
+names(draws_post) <- c("intercept", "tau", "type")
+
+names(draws.w) <- c("intercept", "tau", "type")
+
+
+# unified dataset with all posterior iterations of the meta-analysis models
+smd_data.final <- # draws %>%
+  # mutate(intercept = 0, 
+         # tau = 0) %>%
+  rbind(draws_ext) %>%
+  rbind(draws_int) %>%
+  rbind(draws_pre) %>%
+  rbind(draws_post)
+  
+
+# unified dataset with all data rescaled using each the corresponding reference SD values
+md_data_final <- draws %>%
+  rbind(draws_ext %>% 
+  mutate(intercept = intercept * sppb_external_sd,
+         tau = tau * sppb_external_sd)) %>%
+  rbind(draws_int %>% 
+  mutate(intercept = intercept * sppb_external_sd,
+         tau = tau * sppb_external_sd)) %>%
+  rbind(draws_pre %>% 
+  mutate(intercept = intercept * sppb_external_sd,
+         tau = tau * sppb_external_sd)) %>%
+  rbind(draws_post %>% 
+  mutate(intercept = intercept * sppb_external_sd,
+         tau = tau * sppb_external_sd)) 
+
+
+# numerical data
+numerical.data.smd.final <- # fixef(model) %>%
+  rbind(fixef(model_ext)) %>%
+  rbind(fixef(model_int)) %>%
+  rbind(fixef(model_pre)) %>%
+  rbind(fixef(model_post)) %>%
+  as_tibble() %>%
+  mutate(type = factor(c("External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                         "Study-specific pooled SD\n(at post-intervention)"))) %>%
+  # mutate(Estimate = ifelse(type == "Pooled MD", NA, Estimate)) %>%
+  # mutate(Q2.5 = ifelse(type == "Pooled MD", NA, Q2.5)) %>%
+  # mutate(Q97.5 = ifelse(type == "Pooled MD", NA, Q97.5)) %>%
+  mutate_if(is.numeric, round, 2)
+
+# tau estimates
+posterior_summary(model_post)[2, ] * sppb_external_sd
+
+# numerical MD data
+numerical.data.final <- fixef(model) %>%
+  rbind(fixef(model_ext)) %>%
+  rbind(fixef(model_int)) %>%
+  rbind(fixef(model_pre)) %>%
+  rbind(fixef(model_post)) %>%
+  as_tibble() %>%
+  mutate(type = factor(c("Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                         "Study-specific pooled SD\n(at post-intervention)"))) %>%
+  mutate(Estimate = case_when(
+    type == "Pooled MD" ~ Estimate,
+    type == "External SD" ~ Estimate * sppb_external_sd,
+    type == "Internal SD" ~ Estimate * sppb_external_sd,
+    type == "Study-specific pooled SD\n(at pre-intervention)" ~ Estimate * sppb_external_sd,
+    type == "Study-specific pooled SD\n(at post-intervention)" ~ Estimate * sppb_external_sd
+  )) %>%
+  mutate(Q2.5 = case_when(
+    type == "Pooled MD" ~ Q2.5,
+    type == "External SD" ~ Q2.5 * sppb_external_sd,
+    type == "Internal SD" ~ Q2.5 * sppb_external_sd,
+    type == "Study-specific pooled SD\n(at pre-intervention)" ~ Q2.5 * sppb_external_sd,
+    type == "Study-specific pooled SD\n(at post-intervention)" ~ Q2.5 * sppb_external_sd
+  )) %>%
+  mutate(Q97.5 = case_when(
+    type == "Pooled MD" ~ Q97.5,
+    type == "External SD" ~ Q97.5 * sppb_external_sd,
+    type == "Internal SD" ~ Q97.5 * sppb_external_sd,
+    type == "Study-specific pooled SD\n(at pre-intervention)" ~ Q97.5 * sppb_external_sd,
+    type == "Study-specific pooled SD\n(at post-intervention)" ~ Q97.5 * sppb_external_sd
+  )) %>%
+  mutate_if(is.numeric, round, 2)
+
+
+
+
+# plot
+ggplot(aes(x = intercept, y = relevel(factor(type), "Pooled MD", after = Inf)), data = smd_data.final %>%
+         mutate(type = factor(type, levels = c("Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                                               "Study-specific pooled SD\n(at post-intervention)")))) +
+  stat_interval(aes(col = type)) +
+  geom_point(data = numerical.data.smd.final, aes(Estimate, group = type), size = 3) +
+  geom_vline(xintercept = 0, col = "black", size = 0.5, linetype = 2) +
+  labs(y = "",
+       x = "Standardised Mean Differences",
+       title = "SMD estimates") +
+  scale_x_continuous(limits = c(-0.5, 1.25),
+                     breaks = seq(-1, 2, .25)) +
+  theme_bw() +
+  theme(legend.position = "none")
+
+# density SMD plots
+p1 <- ggplot(aes(x = intercept, y = factor(type)), data = smd_data.final %>%
+         mutate(type = factor(type, levels = c(# "Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                                               "Study-specific pooled SD\n(at post-intervention)")))) +
+  stat_halfeye(aes(fill = type), slab_alpha = 0.5) +
+  geom_vline(xintercept = 0, col = "black", size = 0.5, linetype = 2) +
+  labs(y = "",
+       x = "Relative effect estimates (SMD)") +
+  scale_x_continuous(limits = c(-0.5, 1.25),
+                     breaks = seq(-1, 2, .25)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_lancet()
+
+# tau estimates
+p2 <- ggplot(aes(x = tau, y = factor(type)), data = smd_data.final %>%
+         mutate(type = factor(type, levels = c(# "Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                                               "Study-specific pooled SD\n(at post-intervention)")))) +
+  stat_halfeye(aes(fill = type), slab_alpha = 0.5) +
+  labs(y = "",
+       x = expression(paste(tau, " estimates (SMD)"))) +
+  scale_x_continuous(limits = c(0, 1.5),
+                     breaks = seq(-1, 2, .25)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_lancet()
+
+# plot grid
+tiff("smd_plot.tiff", height = 7, width = 11, units = "in", res = 300)
+plot_grid(p1, p2, labels = c('A', 'B'), label_size = 12)
+dev.off()
+
+# density MD plots
+p1 <- ggplot(aes(x = intercept, y = relevel(factor(type), "Pooled MD", after = Inf)), data = md_data_final %>%
+         mutate(type = factor(type, levels = c("Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                                               "Study-specific pooled SD\n(at post-intervention)")))) +
+  stat_halfeye(aes(fill = type), slab_alpha = 0.5) +
+  geom_vline(xintercept = 0, col = "black", size = 0.5, linetype = 2) +
+  labs(y = "",
+       x = "Relative effect estimates (MD)") +
+  scale_x_continuous(limits = c(-2, 4),
+                     breaks = seq(-2, 4, 1)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_lancet()
+
+p2 <- ggplot(aes(x = tau, y = relevel(factor(type), "Pooled MD", after = Inf)), data = md_data_final %>%
+         mutate(type = factor(type, levels = c("Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                                               "Study-specific pooled SD\n(at post-intervention)")))) +
+  stat_halfeye(aes(fill = type), slab_alpha = 0.5) +
+  labs(y = "",
+       x = expression(paste(tau, " estimates (MD)"))) +
+  scale_x_continuous(limits = c(0, 4),
+                     breaks = seq(-2, 4, 1)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_lancet()
+
+
+p3 <- ggplot(aes(x = intercept, y = relevel(factor(type), "Pooled MD", after = Inf)), data = md_data_final %>%
+         mutate(type = factor(type, levels = c("Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                                               "Study-specific pooled SD\n(at post-intervention)")))) +
+  stat_halfeye(aes(fill = type), slab_alpha = 0.5) +
+  geom_vline(xintercept = 0, col = "black", size = 0.5, linetype = 2) +
+  labs(y = "",
+       x = "Relative effect estimates (MD)") +
+  scale_x_continuous(limits = c(-2, 4),
+                     breaks = seq(-2, 4, 1)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_lancet()
+
+p4 <- ggplot(aes(x = tau, y = relevel(factor(type), "Pooled MD", after = Inf)), data = md_data_final %>%
+         mutate(type = factor(type, levels = c("Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                                               "Study-specific pooled SD\n(at post-intervention)")))) +
+  stat_halfeye(aes(fill = type), slab_alpha = 0.5) +
+  labs(y = "",
+       x = expression(paste(tau, " estimates (MD)"))) +
+  scale_x_continuous(limits = c(0, 4),
+                     breaks = seq(-2, 4, 1)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_lancet()
+
+
+p5 <- ggplot(aes(x = intercept, y = relevel(factor(type), "Pooled MD", after = Inf)), data = md_data_final %>%
+         mutate(type = factor(type, levels = c("Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                                               "Study-specific pooled SD\n(at post-intervention)")))) +
+  stat_halfeye(aes(fill = type), slab_alpha = 0.5) +
+  geom_vline(xintercept = 0, col = "black", size = 0.5, linetype = 2) +
+  labs(y = "",
+       x = "Relative effect estimates (MD)") +
+  scale_x_continuous(limits = c(-2, 4),
+                     breaks = seq(-2, 4, 1)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_lancet()
+
+p6 <- ggplot(aes(x = tau, y = relevel(factor(type), "Pooled MD", after = Inf)), data = md_data_final %>%
+         mutate(type = factor(type, levels = c("Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                                               "Study-specific pooled SD\n(at post-intervention)")))) +
+  stat_halfeye(aes(fill = type), slab_alpha = 0.5) +
+  labs(y = "",
+       x = expression(paste(tau, " estimates (MD)"))) +
+  scale_x_continuous(limits = c(0, 4),
+                     breaks = seq(-2, 4, 1)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_lancet()
+
+# creating complex plots
+plot_1 <- (p1 / p2) + plot_annotation(title = "Method 1")
+plot_2 <- (p3 / p4) + plot_annotation(title = "Method 2")
+plot_3 <- (p5 / p6) + plot_annotation(title = "Method 3")
+
+# combining them
+ggpubr::ggarrange(plot_1, plot_2, plot_3, ncol = 3)
+```
+
+
+
+### SMD estimates and back transformation using the weighted internal SD
+
+Cochrane recommendations stated that for a back transformation process using a scale included in the meta-analysis, it is required to multiply the SMD estimates by the internal SD reference of that specific scale.
+
+```{r}
+# unified dataset with all data rescaled using each the corresponding reference SD values
+md_data_final <- draws %>%
+  rbind(draws_ext %>% 
+  mutate(intercept = intercept * sppb_internal_sd,
+         tau = tau * sppb_internal_sd)) %>%
+  rbind(draws_int %>% 
+  mutate(intercept = intercept * sppb_internal_sd,
+         tau = tau * sppb_internal_sd)) %>%
+  rbind(draws_pre %>% 
+  mutate(intercept = intercept * sppb_internal_sd,
+         tau = tau * sppb_internal_sd)) %>%
+  rbind(draws_post %>% 
+  mutate(intercept = intercept * sppb_internal_sd,
+         tau = tau * sppb_internal_sd)) # %>%
+  # rbind(draws.w %>% 
+  # mutate(intercept = intercept * sppb_internal_sd,
+         # tau = tau * sppb_internal_sd)) 
+
+
+# numerical data
+numerical.data.smd.final <- fixef(model) %>%
+  rbind(fixef(model_ext)) %>%
+  rbind(fixef(model_int)) %>%
+  rbind(fixef(model_pre)) %>%
+  rbind(fixef(model_post)) %>%
+  rbind(fixef(model_w)) %>%
+  as_tibble() %>%
+  mutate(type = factor(c("Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Pre pooled study-specific SD",
+                         "Post pooled study-specific SD",
+                                               "Weighted internal SD"))) %>%
+  mutate(Estimate = ifelse(type == "Pooled MD", NA, Estimate)) %>%
+  mutate(Q2.5 = ifelse(type == "Pooled MD", NA, Q2.5)) %>%
+  mutate(Q97.5 = ifelse(type == "Pooled MD", NA, Q97.5)) %>%
+  mutate_if(is.numeric, round, 2)
+
+
+# numerical MD data
+numerical.data.final <- fixef(model) %>%
+  rbind(fixef(model_ext)) %>%
+  rbind(fixef(model_int)) %>%
+  rbind(fixef(model_pre)) %>%
+  rbind(fixef(model_post)) %>%
+  # rbind(fixef(model_w)) %>%
+  as_tibble() %>%
+  mutate(type = factor(c("Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                         "Study-specific pooled SD\n(at post-intervention)"))) %>%
+  mutate(Estimate = case_when(
+    type == "Pooled MD" ~ Estimate,
+    type == "External SD" ~ Estimate * sppb_weighted_ref,
+    type == "Internal SD" ~ Estimate * sppb_weighted_ref,
+    type == "Study-specific pooled SD\n(at pre-intervention)" ~ Estimate * sppb_weighted_ref,
+    type == "Study-specific pooled SD\n(at post-intervention)" ~ Estimate * sppb_weighted_ref
+  )) %>%
+  mutate(Q2.5 = case_when(
+    type == "Pooled MD" ~ Q2.5,
+    type == "External SD" ~ Q2.5 * sppb_weighted_ref,
+    type == "Internal SD" ~ Q2.5 * sppb_weighted_ref,
+    type == "Study-specific pooled SD\n(at pre-intervention)" ~ Q2.5 * sppb_weighted_ref,
+    type == "Study-specific pooled SD\n(at post-intervention)" ~ Q2.5 * sppb_weighted_ref
+  )) %>%
+  mutate(Q97.5 = case_when(
+    type == "Pooled MD" ~ Q97.5,
+    type == "External SD" ~ Q97.5 * sppb_weighted_ref,
+    type == "Internal SD" ~ Q97.5 * sppb_weighted_ref,
+    type == "Study-specific pooled SD\n(at pre-intervention)" ~ Q97.5 * sppb_weighted_ref,
+    type == "Study-specific pooled SD\n(at post-intervention)" ~ Q97.5 * sppb_weighted_ref
+  )) %>%
+  mutate_if(is.numeric, round, 2)
+
+
+# density SMD plots
+ggplot(aes(x = intercept, y = relevel(factor(type), "Pooled MD", after = Inf)), data = smd_data.final %>%
+         mutate(type = factor(type, levels = c("Pooled MD",
+                                               "Weighted internal SD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Pre pooled study-specific SD",
+                                               "Post pooled study-specific SD")))) +
+  stat_halfeye(aes(fill = type), slab_alpha = 0.5) +
+  geom_vline(xintercept = 0, col = "black", size = 0.5, linetype = 2) +
+  labs(y = "",
+       x = "Standardised Mean Differences",
+       title = "SMD estimates") +
+  scale_x_continuous(limits = c(-0.5, 1.25),
+                     breaks = seq(-1, 2, .25)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_lancet()
+
+
+# density MD plots
+ggplot(aes(x = intercept, y = relevel(factor(type), "Pooled MD", after = Inf)), data = md_data_final %>%
+         mutate(type = factor(type, levels = c("Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                                               "Study-specific pooled SD\n(at post-intervention)")))) +
+  stat_halfeye(aes(fill = type), slab_alpha = 0.5) +
+  geom_vline(xintercept = 0, col = "black", size = 0.5, linetype = 2) +
+  labs(y = "",
+       x = "Relative effect estimates (MD)") +
+  scale_x_continuous(limits = c(-2, 4),
+                     breaks = seq(-2, 4, 1)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_lancet()
+```
+
+
+
+
+### SMD estimates and back transformation using the external SD
+
+Cochrane recommendations stated that for a back transformation process using a scale that was not included in the meta-analysis, it is required to multiply the SMD estimates by a representative external SD reference of that specific scale.
+
+```{r}
+# unified dataset with all data rescaled using each the corresponding reference SD values
+md_data_final <- draws %>%
+  rbind(draws_ext %>% 
+  mutate(intercept = intercept * sppb_external_sd,
+         tau = tau * sppb_external_sd)) %>%
+  rbind(draws_int %>% 
+  mutate(intercept = intercept * sppb_external_sd,
+         tau = tau * sppb_external_sd)) %>%
+  rbind(draws_pre %>% 
+  mutate(intercept = intercept * sppb_external_sd,
+         tau = tau * sppb_external_sd)) %>%
+  rbind(draws_post %>% 
+  mutate(intercept = intercept * sppb_external_sd,
+         tau = tau * sppb_external_sd)) # %>%
+  # rbind(draws.w %>% 
+  #  mutate(intercept = intercept * sppb_external_sd,
+         # tau = tau * sppb_external_sd)) 
+
+
+# numerical data
+numerical.data.smd.final <- fixef(model) %>%
+  rbind(fixef(model_ext)) %>%
+  rbind(fixef(model_int)) %>%
+  rbind(fixef(model_pre)) %>%
+  rbind(fixef(model_post)) %>%
+  rbind(fixef(model_w)) %>%
+  as_tibble() %>%
+  mutate(type = factor(c("Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Pre pooled study-specific SD",
+                         "Post pooled study-specific SD",
+                                               "Weighted internal SD"))) %>%
+  mutate(Estimate = ifelse(type == "Pooled MD", NA, Estimate)) %>%
+  mutate(Q2.5 = ifelse(type == "Pooled MD", NA, Q2.5)) %>%
+  mutate(Q97.5 = ifelse(type == "Pooled MD", NA, Q97.5)) %>%
+  mutate_if(is.numeric, round, 2)
+
+
+# numerical MD data
+numerical.data.final <- fixef(model) %>%
+  rbind(fixef(model_ext)) %>%
+  rbind(fixef(model_int)) %>%
+  rbind(fixef(model_pre)) %>%
+  rbind(fixef(model_post)) %>%
+  # rbind(fixef(model_w)) %>%
+  as_tibble() %>%
+  mutate(type = factor(c("Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                         "Study-specific pooled SD\n(at post-intervention)"))) %>%
+  mutate(Estimate = case_when(
+    type == "Pooled MD" ~ Estimate,
+    type == "External SD" ~ Estimate * sppb_external_sd,
+    type == "Internal SD" ~ Estimate * sppb_external_sd,
+    type == "Study-specific pooled SD\n(at pre-intervention)" ~ Estimate * sppb_external_sd,
+    type == "Study-specific pooled SD\n(at post-intervention)" ~ Estimate * sppb_external_sd
+  )) %>%
+  mutate(Q2.5 = case_when(
+    type == "Pooled MD" ~ Q2.5,
+    type == "External SD" ~ Q2.5 * sppb_external_sd,
+    type == "Internal SD" ~ Q2.5 * sppb_external_sd,
+    type == "Study-specific pooled SD\n(at pre-intervention)" ~ Q2.5 * sppb_external_sd,
+    type == "Study-specific pooled SD\n(at post-intervention)" ~ Q2.5 * sppb_external_sd
+  )) %>%
+  mutate(Q97.5 = case_when(
+    type == "Pooled MD" ~ Q97.5,
+    type == "External SD" ~ Q97.5 * sppb_external_sd,
+    type == "Internal SD" ~ Q97.5 * sppb_external_sd,
+    type == "Study-specific pooled SD\n(at pre-intervention)" ~ Q97.5 * sppb_external_sd,
+    type == "Study-specific pooled SD\n(at post-intervention)" ~ Q97.5 * sppb_external_sd
+  )) %>%
+  mutate_if(is.numeric, round, 2)
+
+
+# density SMD plots
+ggplot(aes(x = intercept, y = relevel(factor(type), "Pooled MD", after = Inf)), data = smd_data.final %>%
+         mutate(type = factor(type, levels = c("Pooled MD",
+                                               "Weighted internal SD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Pre pooled study-specific SD",
+                                               "Post pooled study-specific SD")))) +
+  stat_halfeye(aes(fill = type), slab_alpha = 0.5) +
+  geom_vline(xintercept = 0, col = "black", size = 0.5, linetype = 2) +
+  labs(y = "",
+       x = "Standardised Mean Differences",
+       title = "SMD estimates") +
+  scale_x_continuous(limits = c(-0.5, 1.25),
+                     breaks = seq(-1, 2, .25)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_lancet()
+
+
+# density MD plots
+ggplot(aes(x = intercept, y = relevel(factor(type), "Pooled MD", after = Inf)), data = md_data_final %>%
+         mutate(type = factor(type, levels = c("Pooled MD",
+                                               "Weighted internal SD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Pre pooled study-specific SD",
+                                               "Post pooled study-specific SD")))) +
+  stat_halfeye(aes(fill = type), slab_alpha = 0.5) +
+  geom_vline(xintercept = 0, col = "black", size = 0.5, linetype = 2) +
+  labs(y = "",
+       x = "Standardised Mean Differences",
+       title = "MD estimates") +
+  scale_x_continuous(limits = c(-2, 4),
+                     breaks = seq(-2, 4, 1)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_lancet()
+```
+
+
+
+We then unify all these posterior draws in one database to continue with the posterior visualization of the parameters of interest. 
+
+```{r, fig.height=8, fig.width=8}
+# unified dataset with all posterior iterations of the meta-analysis models
+smd_data.final <- draws %>%
+  mutate(intercept = 0, 
+         tau = 0) %>%
+  rbind(draws_ext) %>%
+  rbind(draws_int) %>%
+  rbind(draws_def) %>%
+  rbind(draws.w) %>%
+  rbind(draws.inf %>%
+          mutate(intercept = 0,
+                 tau = 0)) %>%
+  rbind(draws_ext.inf) %>%
+  rbind(draws_int.inf) %>%
+  rbind(draws_def.inf) %>%
+  rbind(draws_w.inf) %>%
+  rbind(draws.r %>%
+          mutate(intercept = 0,
+                 tau = 0)) %>%
+  rbind(draws_ext.r) %>%
+  rbind(draws_int.r) %>%
+  rbind(draws_def.r) %>%
+  rbind(draws_w.r) %>%
+  rbind(draws_ext.n) %>%
+  rbind(draws_int.n) %>%
+  rbind(draws_def.n) %>%
+  rbind(draws_w.n)
+  
+
+# unified dataset with all data rescaled using each the corresponding reference SD values
+md_data_final <- draws %>%
+  rbind(draws_ext %>% 
+  mutate(intercept = intercept * sppb_external_sd,
+         tau = tau * sppb_external_sd)) %>%
+  rbind(draws_int %>% 
+  mutate(intercept = intercept * sppb_internal_sd,
+         tau = tau * sppb_internal_sd)) %>%
+  rbind(draws_def %>% 
+  mutate(intercept = intercept * sppb_internal_sd,
+         tau = tau * sppb_internal_sd)) %>%
+  rbind(draws.w %>% 
+  mutate(intercept = intercept * sppb_weighted_ref,
+         tau = tau * sppb_weighted_ref)) %>%
+  rbind(draws.inf) %>%
+  rbind(draws_ext.inf %>% 
+  mutate(intercept = intercept * sppb_external_sd,
+         tau = tau * sppb_external_sd)) %>%
+  rbind(draws_int.inf %>% 
+  mutate(intercept = intercept * sppb_internal_sd,
+         tau = tau * sppb_internal_sd)) %>%
+  rbind(draws_def.inf %>% 
+  mutate(intercept = intercept * sppb_internal_sd,
+         tau = tau * sppb_internal_sd)) %>%
+  rbind(draws_w.inf %>% 
+  mutate(intercept = intercept * sppb_weighted_ref,
+         tau = tau * sppb_weighted_ref)) %>%
+  rbind(draws.r) %>%
+  rbind(draws_ext.r %>% 
+  mutate(intercept = intercept * sppb_external_sd,
+         tau = tau * sppb_external_sd)) %>%
+  rbind(draws_int.r %>% 
+  mutate(intercept = intercept * sppb_internal_sd,
+         tau = tau * sppb_internal_sd)) %>%
+  rbind(draws_def.r %>% 
+  mutate(intercept = intercept * sppb_internal_sd,
+         tau = tau * sppb_internal_sd)) %>%
+  rbind(draws_w.r %>% 
+  mutate(intercept = intercept * sppb_weighted_ref,
+         tau = tau * sppb_weighted_ref)) %>%
+  rbind(draws_ext.n %>% 
+  mutate(intercept = intercept * sppb_external_sd,
+         tau = tau * sppb_external_sd)) %>%
+  rbind(draws_int.n %>% 
+  mutate(intercept = intercept * sppb_internal_sd,
+         tau = tau * sppb_internal_sd)) %>%
+  rbind(draws_def.n %>% 
+  mutate(intercept = intercept * sppb_internal_sd,
+         tau = tau * sppb_internal_sd)) %>%
+  rbind(draws_w.n %>% 
+  mutate(intercept = intercept * sppb_weighted_ref,
+         tau = tau * sppb_weighted_ref))
+
+
+### Pooled effect estimates
+
+# numerical SMD data
+numerical.data.smd.final <- fixef(model) %>%
+  rbind(fixef(model_ext)) %>%
+  rbind(fixef(model_int)) %>%
+  rbind(fixef(model_default)) %>%
+  rbind(fixef(model_w)) %>%
+  rbind(fixef(model.inf)) %>%
+  rbind(fixef(model_ext.inf)) %>%
+  rbind(fixef(model_int.inf)) %>%
+  rbind(fixef(model_default.inf)) %>%
+  rbind(fixef(model_w.inf)) %>%
+  rbind(fixef(model.r)) %>%
+  rbind(fixef(model_ext.r)) %>%
+  rbind(fixef(model_int.r)) %>%
+  rbind(fixef(model_default.r)) %>%
+  rbind(fixef(model_w.r)) %>%
+  rbind(fixef(model_ext.n)) %>%
+  rbind(fixef(model_int.n)) %>%
+  rbind(fixef(model_default.n)) %>%
+  rbind(fixef(model_w.n)) %>%
+  as_tibble() %>%
+  mutate(type = c(rep(c("Pooled MD",
+                  "External SD reference model",
+                  "Internal SD reference model",
+                  "Within-study\npooled sample SD model",
+                  "Weighted internal SD reference"), 3),
+                  "External SD reference model",
+                  "Internal SD reference model",
+                  "Within-study\npooled sample SD model",
+                  "Weighted internal SD reference"),
+         model = c(rep("Vague priors", 5),
+                   "Priors 5",
+                   rep("Priors 2", 4),
+                   "Priors 6",
+                   rep("Priors 3", 4),
+                   rep("Priors 4", 4))) %>%
+  mutate(Estimate = ifelse(type == "Pooled MD", NA, Estimate)) %>%
+  mutate(Q2.5 = ifelse(type == "Pooled MD", NA, Q2.5)) %>%
+  mutate(Q97.5 = ifelse(type == "Pooled MD", NA, Q97.5)) %>%
+  mutate_if(is.numeric, round, 2)
+
+# numerical MD data 
+numerical.data.final <- fixef(model) %>%
+  rbind(fixef(model_ext)) %>%
+  rbind(fixef(model_int)) %>%
+  rbind(fixef(model_default)) %>%
+  rbind(fixef(model_w)) %>%
+  rbind(fixef(model.inf)) %>%
+  rbind(fixef(model_ext.inf)) %>%
+  rbind(fixef(model_int.inf)) %>%
+  rbind(fixef(model_default.inf)) %>%
+  rbind(fixef(model_w.inf)) %>%
+  rbind(fixef(model.r)) %>%
+  rbind(fixef(model_ext.r)) %>%
+  rbind(fixef(model_int.r)) %>%
+  rbind(fixef(model_default.r)) %>%
+  rbind(fixef(model_w.r)) %>%
+  rbind(fixef(model_ext.n)) %>%
+  rbind(fixef(model_int.n)) %>%
+  rbind(fixef(model_default.n)) %>%
+  rbind(fixef(model_w.n)) %>%
+  as_tibble() %>%
+  mutate(type = c(rep(c("Pooled MD",
+                  "External SD reference model",
+                  "Internal SD reference model",
+                  "Within-study\npooled sample SD model",
+                  "Weighted internal SD reference"), 3),
+                  "External SD reference model",
+                  "Internal SD reference model",
+                  "Within-study\npooled sample SD model",
+                  "Weighted internal SD reference"),
+         model = c(rep("Vague priors", 5),
+                   "Priors 5",
+                   rep("Priors 2", 4),
+                   "Priors 6",
+                   rep("Priors 3", 4),
+                   rep("Priors 4", 4))) %>%
+  mutate(Estimate = case_when(
+    type == "Pooled MD" ~ Estimate,
+    type == "External SD reference model" ~ Estimate * sppb_external_sd,
+    type == "Internal SD reference model" ~ Estimate * sppb_internal_sd,
+    type == "Within-study\npooled sample SD model" ~ Estimate * sppb_internal_sd,
+    type == "Weighted internal SD reference" ~ Estimate * sppb_weighted_ref
+  )) %>%
+  mutate(Q2.5 = case_when(
+    type == "Pooled MD" ~ Q2.5,
+    type == "External SD reference model" ~ Q2.5 * sppb_external_sd,
+    type == "Internal SD reference model" ~ Q2.5 * sppb_internal_sd,
+    type == "Within-study\npooled sample SD model" ~ Q2.5 * sppb_internal_sd,
+    type == "Weighted internal SD reference" ~ Q2.5 * sppb_weighted_ref
+  )) %>%
+  mutate(Q97.5 = case_when(
+    type == "Pooled MD" ~ Q97.5,
+    type == "External SD reference model" ~ Q97.5 * sppb_external_sd,
+    type == "Internal SD reference model" ~ Q97.5 * sppb_internal_sd,
+    type == "Within-study\npooled sample SD model" ~ Q97.5 * sppb_internal_sd,
+    type == "Weighted internal SD reference" ~ Q97.5 * sppb_weighted_ref
+  )) %>%
+  mutate_if(is.numeric, round, 2)
+
+
+# SMDs estimates visualization
+
+nice_plot.1 <- ggplot(aes(x = intercept, y = relevel(factor(type), "Pooled MD", after = Inf)), data = smd_data.final %>%
+         mutate(model = factor(model, levels = c("Priors 6",
+                                                 "Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors")),
+                type = factor(type, levels = c("Pooled MD",
+                                               "Weighted internal SD reference",
+                                               "External SD reference model",
+                                               "Internal SD reference model",
+                                               "Within-study\npooled sample SD model"),
+                              labels = c("Pooled MD",
+                                         "Method 4",
+                                         "Method 3",
+                                         "Method 2",
+                                         "Method 1")))) +
+  stat_interval(aes(group = model, col = model), position = position_dodge(0.75)) +
+  geom_point(data = numerical.data.smd.final %>%
+               mutate(type = factor(type, levels = c("Pooled MD",
+                                                     "Weighted internal SD reference",
+                                               "External SD reference model",
+                                               "Internal SD reference model",
+                                               "Within-study\npooled sample SD model"),
+                              labels = c("Pooled MD",
+                                         "Method 4",
+                                         "Method 3",
+                                         "Method 2",
+                                         "Method 1")),
+                      model = factor(model, levels = c("Priors 6",
+                                                 "Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors"),
+                               labels = c("Priors 6",
+                                                 "Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors"))), aes(Estimate, group = model), size = 3,
+             position = position_dodge(0.75)) +
+  geom_vline(xintercept = 0, col = "black", size = 0.5, linetype = 2) +
+  labs(y = "",
+       x = "Standardised Mean Differences",
+       title = "SMD estimates") +
+  scale_x_continuous(limits = c(-0.5, 1.25),
+                     breaks = seq(-1, 2, .25)) +
+  scale_color_nejm(breaks = c("Vague priors",
+                                                 "Priors 2",
+                                                 "Priors 3",
+                                                 "Priors 4",
+                                                 "Priors 5",
+                                                 "Priors 6")) +
+  labs(col = "Prior distributions") +
+  theme_bw()
+
+# MD estimates visualization
+# plot 1 for MD values
+nice_plot.2 <- ggplot(aes(x = intercept, y = relevel(factor(type), "Pooled MD", after = Inf)), data = md_data_final %>%
+         mutate(model = factor(model, levels = c("Priors 6",
+                                                 "Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors")),
+                type = factor(type, levels = c("Pooled MD",
+                                               "Weighted internal SD reference",
+                                               "External SD reference model",
+                                               "Internal SD reference model",
+                                               "Within-study\npooled sample SD model"),
+                              labels = c("Pooled MD",
+                                         "Method 4",
+                                         "Method 3",
+                                         "Method 2",
+                                         "Method 1")))) +
+  stat_interval(aes(group = model, col = model), position = position_dodge(0.75)) +
+  geom_point(data = numerical.data.final %>%
+               mutate(type = factor(type, levels = c("Pooled MD",
+                                                     "Weighted internal SD reference",
+                                               "External SD reference model",
+                                               "Internal SD reference model",
+                                               "Within-study\npooled sample SD model"),
+                              labels = c("Pooled MD",
+                                         "Method 4",
+                                         "Method 3",
+                                         "Method 2",
+                                         "Method 1")),
+                      model = factor(model, levels = c("Priors 6",
+                                                 "Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors"),
+                               labels = c("Priors 6",
+                                                 "Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors"))), aes(Estimate, group = model), size = 3,
+             position = position_dodge(0.75)) +
+  geom_vline(xintercept = 0, size = .5, linetype = 2) +
+  labs(y = "",
+       x = "Mean Differences",
+       title = "MD estimates") +
+  scale_x_continuous(limits = c(-0.75, 2.5),
+                     breaks = seq(-1, 2.5, .5)) +
+  scale_color_nejm(breaks = c("Vague priors",
+                                                 "Priors 2",
+                                                 "Priors 3",
+                                                 "Priors 4",
+                                                 "Priors 5",
+                                                 "Priors 6")) +
+  labs(col = "Prior distributions") +
+  theme_bw()
+
+# combining effect estimates plots
+effect_plot <- nice_plot.1 + nice_plot.2
+
+
+  
+### Between-study SD estimates
+
+# numerical data as SMDs
+het.numerical.data <- brms::posterior_summary(model)[2, ] %>%
+  rbind(posterior_summary(model_ext)[2, ]) %>%
+  rbind(posterior_summary(model_int)[2, ]) %>%
+  rbind(posterior_summary(model_default)[2, ]) %>%
+  rbind(posterior_summary(model_w)[2, ]) %>%
+  rbind(posterior_summary(model.inf)[2, ]) %>%
+  rbind(posterior_summary(model_ext.inf)[2, ]) %>%
+  rbind(posterior_summary(model_int.inf)[2, ]) %>%
+  rbind(posterior_summary(model_w.inf)[2, ]) %>% 
+  rbind(posterior_summary(model_default.inf)[2, ]) %>%
+  rbind(posterior_summary(model.r)[2, ]) %>%
+  rbind(posterior_summary(model_ext.r)[2, ]) %>%
+  rbind(posterior_summary(model_int.r)[2, ]) %>%
+  rbind(posterior_summary(model_default.r)[2, ]) %>%
+  rbind(posterior_summary(model_w.r)[2, ]) %>%
+  rbind(posterior_summary(model_ext.n)[2, ]) %>%
+  rbind(posterior_summary(model_int.n)[2, ]) %>%
+  rbind(posterior_summary(model_default.n)[2, ]) %>%
+  rbind(posterior_summary(model_w.n)[2, ]) %>%
+  as_tibble() %>%
+  mutate(type = c(rep(c("Pooled MD",
+                  "External SD reference model",
+                  "Internal SD reference model",
+                  "Within-study\npooled sample SD model",
+                  "Weighted internal SD reference"), 3),
+                  "External SD reference model",
+                  "Internal SD reference model",
+                  "Within-study\npooled sample SD model",
+                  "Weighted internal SD reference"),
+         model = c(rep("Vague priors", 5),
+                   "Priors 5",
+                   rep("Priors 2", 4),
+                   "Priors 6",
+                   rep("Priors 3", 4),
+                   rep("Priors 4", 4))) %>%
+  mutate(Estimate = ifelse(type == "Pooled MD", NA, Estimate)) %>%
+  mutate(Q2.5 = ifelse(type == "Pooled MD", NA, Q2.5)) %>%
+  mutate(Q97.5 = ifelse(type == "Pooled MD", NA, Q97.5)) %>%
+  mutate_if(is.numeric, round, 2)
+
+# rescaled between-study SD 
+het.numerical.data.rescaled <- brms::posterior_summary(model)[2, ] %>%
+  rbind(posterior_summary(model_ext)[2, ]) %>%
+  rbind(posterior_summary(model_int)[2, ]) %>%
+  rbind(posterior_summary(model_default)[2, ]) %>%
+  rbind(posterior_summary(model_w)[2, ]) %>%
+  rbind(posterior_summary(model.inf)[2, ]) %>%
+  rbind(posterior_summary(model_ext.inf)[2, ]) %>%
+  rbind(posterior_summary(model_int.inf)[2, ]) %>%
+  rbind(posterior_summary(model_w.inf)[2, ]) %>% 
+  rbind(posterior_summary(model_default.inf)[2, ]) %>%
+  rbind(posterior_summary(model.r)[2, ]) %>%
+  rbind(posterior_summary(model_ext.r)[2, ]) %>%
+  rbind(posterior_summary(model_int.r)[2, ]) %>%
+  rbind(posterior_summary(model_default.r)[2, ]) %>%
+  rbind(posterior_summary(model_w.r)[2, ]) %>%
+  rbind(posterior_summary(model_ext.n)[2, ]) %>%
+  rbind(posterior_summary(model_int.n)[2, ]) %>%
+  rbind(posterior_summary(model_default.n)[2, ]) %>%
+  rbind(posterior_summary(model_w.n)[2, ]) %>%
+  as_tibble() %>%
+  mutate(type = c(rep(c("Pooled MD",
+                  "External SD reference model",
+                  "Internal SD reference model",
+                  "Within-study\npooled sample SD model",
+                  "Weighted internal SD reference"), 3),
+                  "External SD reference model",
+                  "Internal SD reference model",
+                  "Within-study\npooled sample SD model",
+                  "Weighted internal SD reference"),
+         model = c(rep("Vague priors", 5),
+                   "Priors 5",
+                   rep("Priors 2", 4),
+                   "Priors 6",
+                   rep("Priors 3", 4),
+                   rep("Priors 4", 4))) %>%
+  mutate(Estimate = case_when(
+    type == "Pooled MD" ~ Estimate,
+    type == "External SD reference model" ~ Estimate * sppb_external_sd,
+    type == "Internal SD reference model" ~ Estimate * sppb_internal_sd,
+    type == "Within-study\npooled sample SD model" ~ Estimate * sppb_internal_sd,
+    type == "Weighted internal SD reference" ~ Estimate * sppb_weighted_ref 
+  )) %>%
+  mutate(Q2.5 = case_when(
+    type == "Pooled MD" ~ Q2.5,
+    type == "External SD reference model" ~ Q2.5 * sppb_external_sd,
+    type == "Internal SD reference model" ~ Q2.5 * sppb_internal_sd,
+    type == "Within-study\npooled sample SD model" ~ Q2.5 * sppb_internal_sd,
+    type == "Weighted internal SD reference" ~ Q2.5 * sppb_weighted_ref
+  )) %>%
+  mutate(Q97.5 = case_when(
+    type == "Pooled MD" ~ Q97.5,
+    type == "External SD reference model" ~ Q97.5 * sppb_external_sd,
+    type == "Internal SD reference model" ~ Q97.5 * sppb_internal_sd,
+    type == "Within-study\npooled sample SD model" ~ Q97.5 * sppb_internal_sd,
+    type == "Weighted internal SD reference" ~ Q97.5 * sppb_weighted_ref
+  )) %>%
+  mutate_if(is.numeric, round, 2)
+
+
+# plot for heterogeneity in SMD terms
+nice_plot.3 <- ggplot(aes(x = tau, y = relevel(factor(type), "Pooled MD", after = Inf)), data = smd_data.final %>%
+         mutate(model = factor(model, levels = c("Priors 6",
+                                                 "Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors")),
+                type = factor(type, levels = c("Pooled MD",
+                                               "Weighted internal SD reference",
+                                               "External SD reference model",
+                                               "Internal SD reference model",
+                                               "Within-study\npooled sample SD model"),
+                              labels = c("Pooled MD",
+                                         "Method 4",
+                                         "Method 3",
+                                         "Method 2",
+                                         "Method 1")))) +
+  stat_interval(aes(group = model, col = model), position = position_dodge(0.75)) +
+  geom_point(data = het.numerical.data %>%
+               mutate(type = factor(type, levels = c("Pooled MD",
+                                                     "Weighted internal SD reference",
+                                               "External SD reference model",
+                                               "Internal SD reference model",
+                                               "Within-study\npooled sample SD model"),
+                              labels = c("Pooled MD",
+                                         "Method 4",
+                                         "Method 3",
+                                         "Method 2",
+                                         "Method 1")),
+                      model = factor(model, levels = c("Priors 6",
+                                                 "Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors"),
+                               labels = c("Priors 6",
+                                                 "Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors"))), aes(Estimate, group = model), size = 3,
+             position = position_dodge(0.75)) +
+  labs(y = "",
+       x = expression(paste(tau)),
+       title = "Between-study SD") +
+  scale_x_continuous(limits = c(0, 1.5),
+                     breaks = seq(-1, 2.5, .25)) +
+  scale_color_nejm(breaks = c("Vague priors",
+                                                 "Priors 2",
+                                                 "Priors 3",
+                                                 "Priors 4",
+                                                 "Priors 5",
+                                                 "Priors 6")) +
+  labs(col = "Prior distributions") +
+  theme_bw()
+
+
+# back-conversion visualization
+nice_plot.4 <- ggplot(aes(x = tau, y = relevel(factor(type), "Pooled MD", after = Inf)), data = md_data_final %>%
+         mutate(model = factor(model, levels = c("Priors 6",
+                                                 "Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors")),
+                type = factor(type, levels = c("Pooled MD",
+                                               "Weighted internal SD reference",
+                                               "External SD reference model",
+                                               "Internal SD reference model",
+                                               "Within-study\npooled sample SD model"),
+                              labels = c("Pooled MD",
+                                         "Method 4",
+                                         "Method 3",
+                                         "Method 2",
+                                         "Method 1")))) +
+  stat_interval(aes(group = model, col = model), position = position_dodge(0.75)) +
+  geom_point(data = het.numerical.data.rescaled %>%
+               mutate(type = factor(type, levels = c("Pooled MD",
+                                                     "Weighted internal SD reference",
+                                               "External SD reference model",
+                                               "Internal SD reference model",
+                                               "Within-study\npooled sample SD model"),
+                              labels = c("Pooled MD",
+                                         "Method 4",
+                                         "Method 3",
+                                         "Method 2",
+                                         "Method 1")),
+                      model = factor(model, levels = c("Priors 6",
+                                                 "Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors"),
+                               labels = c("Priors 6",
+                                                 "Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors"))), aes(Estimate, group = model), size = 3,
+             position = position_dodge(0.75)) +
+  labs(y = "",
+       x = expression(paste(tau)),
+       title = "Between-study SD (MD estimates)") +
+  scale_x_continuous(limits = c(0, 3.25),
+                     breaks = seq(-1, 5.5, .5)) +
+  scale_color_nejm(breaks = c("Vague priors",
+                                                 "Priors 2",
+                                                 "Priors 3",
+                                                 "Priors 4",
+                                                 "Priors 5",
+                                                 "Priors 6")) +
+  labs(col = "Prior distributions") +
+  theme_bw()
+
+# combining plots
+het.plot <- nice_plot.3 + nice_plot.4
+
+
+# plot!
+ggarrange(nice_plot.1, nice_plot.2, nice_plot.3, nice_plot.4, ncol = 2, nrow = 2, common.legend = TRUE, legend = "bottom")
+```
+
+
+
+## Barthel index
+
+Let's save the SD references for this outcome.
+
+```{r}
+# external SD reference used for standardization
+external_sd.bi <- 25.39
+
+# internal SD reference used for standardization
+internal_sd.bi <- sum(bi_data$pre_sd_pooled) / nrow(bi_data)
+
+# internal SD reference used for standardization
+internal_sd.bi.post <- sum(bi_data$post_sd_pooled) / nrow(bi_data)
+
+## weighted internal SD reference
+weighted_sd.bi <- 17.209999
+```
+
+
+#### Bit of data wrangling
+
+```{r}
+bi_data <- bi_data %>%
+               mutate(studyID = case_when(
+                 studyID == "Martinez-Velilla, 2019" ~ "Martinez-Velilla1",
+                 studyID == "Martinez-Velilla, 2021" ~ "Martinez-Velilla2",
+                 studyID == "Martinez-Velilla, 2022" ~ "Martinez-Velilla3",
+                 studyID == "de Morton, 2007" ~ "de Morton, 2007",
+                 studyID == "Casas-Herrero, 2022" ~ "Casas-Herrero, 2022"
+               ),
+               diff_w = diff / weighted_sd.bi,
+         se_diff_w = se_diff / weighted_sd.bi)
+```
+
+
+
+## Fitting our meta-analysis models
+
+```{r, results='hide', message=FALSE, warning=FALSE, error=FALSE}
+# for reproducibility sake
+set.seed(28032023)
+
+# multilevel random-intercept meta-analysis using MD 
+model.bi <- brm(diff | se(se_diff, sigma = TRUE) ~ 1 + (1 | studyID),
+             data = bi_data,
+             family = gaussian(),
+             prior = vague_priors,
+             control = list(adapt_delta = 0.99),
+             iter = 4000, warmup = 1000)
+
+# multilevel random-intercept meta-analysis using SMDs rescaled using an external SD reference 
+model_ext.bi <- brm(diff_ext | se(se_diff_ext, sigma = TRUE) ~ 1 + (1 | studyID),
+             data = bi_data,
+             family = gaussian(),
+             prior = vague_priors,
+             control = list(adapt_delta = 0.99),
+             iter = 4000, warmup = 1000)
+
+# multilevel random-intercept meta-analysis using SMDs rescaled using an internal SD reference 
+model_int.bi <- brm(diff_int | se(se_diff_int, sigma = TRUE) ~ 1 + (1 | studyID),
+             data = bi_data,
+             family = gaussian(),
+             prior = vague_priors,
+             control = list(adapt_delta = 0.99),
+             iter = 4000, warmup = 1000)
+
+# multilevel random-intercept meta-analysis using SMDs rescaled using the pooled SD of each study
+model_pre.bi <- brm(diff_pre | se(se_diff_pre, sigma = TRUE) ~ 1 + (1 | studyID),
+             data = bi_data,
+             family = gaussian(),
+             prior = vague_priors,
+             control = list(adapt_delta = 0.99),
+             iter = 4000, warmup = 1000)
+
+# multilevel random-intercept meta-analysis using SMDs rescaled using the pooled SD of each study
+model_post.bi <- brm(diff_post | se(se_diff_post, sigma = TRUE) ~ 1 + (1 | studyID),
+             data = bi_data,
+             family = gaussian(),
+             prior = vague_priors,
+             control = list(adapt_delta = 0.99),
+             iter = 4000, warmup = 1000)
+
+# multilevel random-intercept meta-analysis using SMDs rescaled using a weighted internal SD reference
+model.w.bi <- brm(diff_w | se(se_diff_w) ~ 1 + (1 | studyID),
+             data = bi_data,
+             family = gaussian(),
+             prior = vague_priors,
+             control = list(adapt_delta = 0.99),
+             iter = 4000, warmup = 1000)
+```
+  
+
+#### Convergence analysis
+
+First, let's check if our model reached the convergence. We first check the mixing of the Markov Chain Monte-Carlo simulations, and we then observe the Potential Scale Reduction Factor ($\hat{R}$ parameter) which should be smaller than 1.05.
+
+```{r}
+# good mixing of our predictive chains
+plot(model.bi)
+
+# posterior predictive check
+pp_plot <- pp_check(model.bi, ndraws = 50)
+pp_plot.1 <- pp_check(model_pre.bi, ndraws = 50)
+pp_plot.2 <- pp_check(model_post.bi, ndraws = 50)
+pp_plot.3 <- pp_check(model_int.bi, ndraws = 50)
+pp_plot.4 <- pp_check(model_ext.bi, ndraws = 50)
+
+# observed Rhat value below 1.05
+summary(model.bi)
+```
+
+
+### Extracting and visualizing posterior tidy draws
+
+First, we extract the posterior draws for each model corresponding to the random intercept for each study and the between-study heterogeneity. Additionally, we create a variable (`type`) that indicates the meta-analysis model.
+
+```{r}
+# extract the posterior draws of the models
+## observed mean differences
+draws.bi <- posterior_samples(model.bi, c("^b", "^sd")) %>%
+  mutate(type = "Pooled MD")
+
+## mean differences rescaled using an external SD reference
+draws_ext.bi <- posterior_samples(model_ext.bi, c("^b", "^sd")) %>%
+  mutate(type = "External SD")
+
+## mean differences rescaled using an internal SD reference
+draws_int.bi <- posterior_samples(model_int.bi, c("^b", "^sd")) %>%
+  mutate(type = "Internal SD")
+
+## mean differences rescaled using the pooled SD of each study
+draws_pre.bi <- posterior_samples(model_pre.bi, c("^b", "^sd")) %>%
+  mutate(type = "Study-specific pooled SD\n(at pre-intervention)")
+
+## mean differences rescaled using the pooled SD of each study
+draws_post.bi <- posterior_samples(model_post.bi, c("^b", "^sd")) %>%
+  mutate(type = "Study-specific pooled SD\n(at post-intervention)")
+
+
+# change the variables' names for simplicity sake
+names(draws.bi) <- c("intercept", "tau", "type")
+
+names(draws_ext.bi) <- c("intercept", "tau", "type")
+
+names(draws_int.bi) <- c("intercept", "tau", "type")
+
+names(draws_pre.bi) <- c("intercept", "tau", "type")
+
+names(draws_post.bi) <- c("intercept", "tau", "type")
+
+
+# unified dataset with all posterior iterations of the meta-analysis models
+smd_data.final.bi <- # draws %>%
+  # mutate(intercept = 0, 
+         # tau = 0) %>%
+  rbind(draws_ext.bi) %>%
+  rbind(draws_int.bi) %>%
+  rbind(draws_pre.bi) %>%
+  rbind(draws_post.bi)
+  
+
+# unified dataset with all data rescaled using each the corresponding reference SD values
+md_data_final.bi <- draws.bi %>%
+  rbind(draws_ext.bi %>% 
+  mutate(intercept = intercept * weighted_sd.bi,
+         tau = tau * weighted_sd.bi)) %>%
+  rbind(draws_int.bi %>% 
+  mutate(intercept = intercept * weighted_sd.bi,
+         tau = tau * weighted_sd.bi)) %>%
+  rbind(draws_pre.bi %>% 
+  mutate(intercept = intercept * weighted_sd.bi,
+         tau = tau * weighted_sd.bi)) %>%
+  rbind(draws_post.bi %>% 
+  mutate(intercept = intercept * weighted_sd.bi,
+         tau = tau * weighted_sd.bi)) 
+```
+
+```{r}
+# numerical data
+numerical.data.smd.final.bi <- # fixef(model) %>%
+  rbind(fixef(model_ext.bi)) %>%
+  rbind(fixef(model_int.bi)) %>%
+  rbind(fixef(model_pre.bi)) %>%
+  rbind(fixef(model_post.bi)) %>%
+  as_tibble() %>%
+  mutate(type = factor(c("External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                         "Study-specific pooled SD\n(at post-intervention)"))) %>%
+  # mutate(Estimate = ifelse(type == "Pooled MD", NA, Estimate)) %>%
+  # mutate(Q2.5 = ifelse(type == "Pooled MD", NA, Q2.5)) %>%
+  # mutate(Q97.5 = ifelse(type == "Pooled MD", NA, Q97.5)) %>%
+  mutate_if(is.numeric, round, 2)
+
+# tau estimates
+posterior_summary(model_int.bi)[2, ] * internal_sd.bi
+
+# numerical MD data
+numerical.data.final.bi <- fixef(model.bi) %>%
+  rbind(fixef(model_ext.bi)) %>%
+  rbind(fixef(model_int.bi)) %>%
+  rbind(fixef(model_pre.bi)) %>%
+  rbind(fixef(model_post.bi)) %>%
+  as_tibble() %>%
+  mutate(type = factor(c("Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                         "Study-specific pooled SD\n(at post-intervention)"))) %>%
+  mutate(Estimate = case_when(
+    type == "Pooled MD" ~ Estimate,
+    type == "External SD" ~ Estimate * external_sd.bi,
+    type == "Internal SD" ~ Estimate * internal_sd.bi,
+    type == "Study-specific pooled SD\n(at pre-intervention)" ~ Estimate * internal_sd.bi,
+    type == "Study-specific pooled SD\n(at post-intervention)" ~ Estimate * internal_sd.bi.post
+  )) %>%
+  mutate(Q2.5 = case_when(
+    type == "Pooled MD" ~ Q2.5,
+    type == "External SD" ~ Q2.5 * external_sd.bi,
+    type == "Internal SD" ~ Q2.5 * internal_sd.bi,
+    type == "Study-specific pooled SD\n(at pre-intervention)" ~ Q2.5 * internal_sd.bi,
+    type == "Study-specific pooled SD\n(at post-intervention)" ~ Q2.5 * internal_sd.bi.post
+  )) %>%
+  mutate(Q97.5 = case_when(
+    type == "Pooled MD" ~ Q97.5,
+    type == "External SD" ~ Q97.5 * external_sd.bi,
+    type == "Internal SD" ~ Q97.5 * internal_sd.bi,
+    type == "Study-specific pooled SD\n(at pre-intervention)" ~ Q97.5 * internal_sd.bi,
+    type == "Study-specific pooled SD\n(at post-intervention)" ~ Q97.5 * internal_sd.bi.post
+  )) %>%
+  mutate_if(is.numeric, round, 2)
+
+
+
+
+# plot
+# density SMD plots
+p1.bi <- ggplot(aes(x = intercept, y = factor(type)), data = smd_data.final.bi %>%
+         mutate(type = factor(type, levels = c(# "Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                                               "Study-specific pooled SD\n(at post-intervention)")))) +
+  stat_halfeye(aes(fill = type), slab_alpha = 0.5) +
+  geom_vline(xintercept = 0, col = "black", size = 0.5, linetype = 2) +
+  labs(y = "",
+       x = "Relative effect estimates (SMD)") +
+  scale_x_continuous(limits = c(-0.75, 1),
+                     breaks = seq(-1, 2, .25)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_lancet()
+
+# tau estimates
+p2.bi <- ggplot(aes(x = tau, y = factor(type)), data = smd_data.final.bi %>%
+         mutate(type = factor(type, levels = c(# "Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                                               "Study-specific pooled SD\n(at post-intervention)")))) +
+  stat_halfeye(aes(fill = type), slab_alpha = 0.5) +
+  labs(y = "",
+       x = expression(paste(tau, " estimates (SMD)"))) +
+  scale_x_continuous(limits = c(0, 1.5),
+                     breaks = seq(-1, 2, .25)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_lancet()
+
+# plot grid
+plot_grid(p1.bi, p2.bi, labels = c('A', 'B'), label_size = 12)
+
+
+# density MD plots
+p1.bi <- ggplot(aes(x = intercept, y = relevel(factor(type), "Pooled MD", after = Inf)), data = md_data_final.bi %>%
+         mutate(type = factor(type, levels = c("Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                                               "Study-specific pooled SD\n(at post-intervention)")))) +
+  stat_halfeye(aes(fill = type), slab_alpha = 0.5) +
+  geom_vline(xintercept = 0, col = "black", size = 0.5, linetype = 2) +
+  labs(y = "",
+       x = "Relative effect estimates (MD)") +
+  scale_x_continuous(limits = c(-8, 18),
+                     breaks = seq(-10, 20, 2)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_lancet()
+
+p2.bi <- ggplot(aes(x = tau, y = relevel(factor(type), "Pooled MD", after = Inf)), data = md_data_final.bi %>%
+         mutate(type = factor(type, levels = c("Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                                               "Study-specific pooled SD\n(at post-intervention)")))) +
+  stat_halfeye(aes(fill = type), slab_alpha = 0.5) +
+  labs(y = "",
+       x = expression(paste(tau, " estimates (MD)"))) +
+  scale_x_continuous(limits = c(0, 20),
+                     breaks = seq(-2, 20, 2)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_lancet()
+
+
+p3.bi <- ggplot(aes(x = intercept, y = relevel(factor(type), "Pooled MD", after = Inf)), data = md_data_final.bi %>%
+         mutate(type = factor(type, levels = c("Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                                               "Study-specific pooled SD\n(at post-intervention)")))) +
+  stat_halfeye(aes(fill = type), slab_alpha = 0.5) +
+  geom_vline(xintercept = 0, col = "black", size = 0.5, linetype = 2) +
+  labs(y = "",
+       x = "Relative effect estimates (MD)") +
+  scale_x_continuous(limits = c(-8, 18),
+                     breaks = seq(-10, 20, 2)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_lancet()
+
+p4.bi <- ggplot(aes(x = tau, y = relevel(factor(type), "Pooled MD", after = Inf)), data = md_data_final.bi %>%
+         mutate(type = factor(type, levels = c("Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                                               "Study-specific pooled SD\n(at post-intervention)")))) +
+  stat_halfeye(aes(fill = type), slab_alpha = 0.5) +
+  labs(y = "",
+       x = expression(paste(tau, " estimates (MD)"))) +
+  scale_x_continuous(limits = c(0, 20),
+                     breaks = seq(-2, 20, 2)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_lancet()
+
+
+p5.bi <- ggplot(aes(x = intercept, y = relevel(factor(type), "Pooled MD", after = Inf)), data = md_data_final.bi %>%
+         mutate(type = factor(type, levels = c("Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                                               "Study-specific pooled SD\n(at post-intervention)")))) +
+  stat_halfeye(aes(fill = type), slab_alpha = 0.5) +
+  geom_vline(xintercept = 0, col = "black", size = 0.5, linetype = 2) +
+  labs(y = "",
+       x = "Relative effect estimates (MD)") +
+  scale_x_continuous(limits = c(-8, 18),
+                     breaks = seq(-10, 20, 2)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_lancet()
+
+p6.bi <- ggplot(aes(x = tau, y = relevel(factor(type), "Pooled MD", after = Inf)), data = md_data_final.bi %>%
+         mutate(type = factor(type, levels = c("Pooled MD",
+                                               "External SD",
+                                               "Internal SD",
+                                               "Study-specific pooled SD\n(at pre-intervention)",
+                                               "Study-specific pooled SD\n(at post-intervention)")))) +
+  stat_halfeye(aes(fill = type), slab_alpha = 0.5) +
+  labs(y = "",
+       x = expression(paste(tau, " estimates (MD)"))) +
+  scale_x_continuous(limits = c(0, 20),
+                     breaks = seq(-2, 20, 2)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_fill_lancet()
+
+# building complex plots
+plot_1.bi <- (p1.bi / p2.bi) + plot_annotation(title = "Method 1")
+plot_2.bi <- (p3.bi / p4.bi) + plot_annotation(title = "Method 2")
+plot_3.bi <- (p5.bi / p6.bi) + plot_annotation(title = "Method 3")
+
+# combining them
+ggpubr::ggarrange(plot_1.bi, plot_2.bi, plot_3.bi, ncol = 3)
+```
+
+
+We then unify all these posterior draws in one database to continue with the posterior visualization of the parameters of interest. 
+
+```{r, fig.height=8, fig.width=8}
+# unified dataset with all posterior iterations of the meta-analysis models
+smd_data.final.bi <- draws.bi %>%
+  mutate(intercept = 0, 
+         tau = 0) %>%
+  rbind(draws_ext.bi) %>%
+  rbind(draws_int.bi) %>%
+  rbind(draws_def.bi) %>%
+  rbind(draws_w.bi) %>%
+  rbind(draws.inf.bi %>%
+          mutate(intercept = 0,
+                 tau = 0)) %>%
+  rbind(draws_ext.inf.bi) %>%
+  rbind(draws_int.inf.bi) %>%
+  rbind(draws_def.inf.bi) %>%
+  rbind(draws_w.inf.bi) %>%
+  rbind(draws_ext.r.bi) %>%
+  rbind(draws_int.r.bi) %>%
+  rbind(draws_def.r.bi) %>%
+  rbind(draws_w.r.bi) %>%
+  rbind(draws_ext.n.bi) %>%
+  rbind(draws_int.n.bi) %>%
+  rbind(draws_def.n.bi) %>%
+  rbind(draws_w.n.bi)
+  
+
+# unified dataset with all data rescaled using each the corresponding reference SD values
+md_data_final.bi <- draws.bi %>%
+  rbind(draws_ext.bi %>% 
+  mutate(intercept = intercept * external_sd.bi,
+         tau = tau * external_sd.bi)) %>%
+  rbind(draws_int.bi %>% 
+  mutate(intercept = intercept * internal_sd.bi,
+         tau = tau * internal_sd.bi)) %>%
+  rbind(draws_def.bi %>% 
+  mutate(intercept = intercept * internal_sd.bi,
+         tau = tau * internal_sd.bi)) %>%
+  rbind(draws_w.bi %>% 
+  mutate(intercept = intercept * weighted_sd.bi,
+         tau = tau * weighted_sd.bi)) %>%
+  rbind(draws.inf.bi) %>%
+  rbind(draws_ext.inf.bi %>% 
+  mutate(intercept = intercept * external_sd.bi,
+         tau = tau * external_sd.bi)) %>%
+  rbind(draws_int.inf.bi %>% 
+  mutate(intercept = intercept * internal_sd.bi,
+         tau = tau * internal_sd.bi)) %>%
+  rbind(draws_def.inf.bi %>% 
+  mutate(intercept = intercept * internal_sd.bi,
+         tau = tau * internal_sd.bi)) %>%
+  rbind(draws_w.inf.bi %>% 
+  mutate(intercept = intercept * weighted_sd.bi,
+         tau = tau * weighted_sd.bi)) %>%
+  rbind(draws_ext.r.bi %>% 
+  mutate(intercept = intercept * external_sd.bi,
+         tau = tau * external_sd.bi)) %>%
+  rbind(draws_int.r.bi %>% 
+  mutate(intercept = intercept * internal_sd.bi,
+         tau = tau * internal_sd.bi)) %>%
+  rbind(draws_def.r.bi %>% 
+  mutate(intercept = intercept * internal_sd.bi,
+         tau = tau * internal_sd.bi)) %>%
+  rbind(draws_w.r.bi %>% 
+  mutate(intercept = intercept * weighted_sd.bi,
+         tau = tau * weighted_sd.bi)) %>%
+  rbind(draws_ext.n.bi %>% 
+  mutate(intercept = intercept * external_sd.bi,
+         tau = tau * external_sd.bi)) %>%
+  rbind(draws_int.n.bi %>% 
+  mutate(intercept = intercept * internal_sd.bi,
+         tau = tau * internal_sd.bi)) %>%
+  rbind(draws_def.n.bi %>% 
+  mutate(intercept = intercept * internal_sd.bi,
+         tau = tau * internal_sd.bi)) %>%
+  rbind(draws_w.n.bi %>% 
+  mutate(intercept = intercept * weighted_sd.bi,
+         tau = tau * weighted_sd.bi))
+
+
+### Pooled effect estimates
+
+# numerical SMD data
+numerical.data.smd.final.bi <- fixef(model.bi) %>%
+  rbind(fixef(model_ext.bi)) %>%
+  rbind(fixef(model_int.bi)) %>%
+  rbind(fixef(model_default.bi)) %>%
+  rbind(fixef(model.w.bi)) %>%
+  rbind(fixef(model.inf.bi)) %>%
+  rbind(fixef(model_ext.inf.bi)) %>%
+  rbind(fixef(model_int.inf.bi)) %>%
+  rbind(fixef(model_default.inf.bi)) %>%
+  rbind(fixef(model.w.inf.bi)) %>%
+  rbind(fixef(model_ext.r.bi)) %>%
+  rbind(fixef(model_int.r.bi)) %>%
+  rbind(fixef(model_default.r.bi)) %>%
+  rbind(fixef(model.w.r.bi)) %>%
+  rbind(fixef(model_ext.n.bi)) %>%
+  rbind(fixef(model_int.n.bi)) %>%
+  rbind(fixef(model_default.n.bi)) %>%
+  rbind(fixef(model.w.n.bi)) %>%
+  as_tibble() %>%
+  mutate(type = c(rep(c("Pooled MD",
+                  "External SD reference model",
+                  "Internal SD reference model",
+                  "Within-study\npooled sample SD model",
+                  "Weighted internal SD reference"), 2),
+                  rep(c("External SD reference model",
+                  "Internal SD reference model",
+                  "Within-study\npooled sample SD model",
+                  "Weighted internal SD reference"), 2)),
+         model = c(rep("Vague priors", 5),
+                   "Priors 5",
+                   rep("Priors 2", 4),
+                   rep("Priors 3", 4),
+                   rep("Priors 4", 4))) %>%
+  mutate(Estimate = ifelse(type == "Pooled MD", NA, Estimate)) %>%
+  mutate(Q2.5 = ifelse(type == "Pooled MD", NA, Q2.5)) %>%
+  mutate(Q97.5 = ifelse(type == "Pooled MD", NA, Q97.5)) %>%
+  mutate_if(is.numeric, round, 2)
+
+# numerical MD data 
+numerical.data.final.bi <- fixef(model.bi) %>%
+  rbind(fixef(model_ext.bi)) %>%
+  rbind(fixef(model_int.bi)) %>%
+  rbind(fixef(model_default.bi)) %>%
+  rbind(fixef(model.w.bi)) %>%
+  rbind(fixef(model.inf.bi)) %>%
+  rbind(fixef(model_ext.inf.bi)) %>%
+  rbind(fixef(model_int.inf.bi)) %>%
+  rbind(fixef(model_default.inf.bi)) %>%
+  rbind(fixef(model.w.inf.bi)) %>%
+  rbind(fixef(model_ext.r.bi)) %>%
+  rbind(fixef(model_int.r.bi)) %>%
+  rbind(fixef(model_default.r.bi)) %>%
+  rbind(fixef(model.w.r.bi)) %>%
+  rbind(fixef(model_ext.n.bi)) %>%
+  rbind(fixef(model_int.n.bi)) %>%
+  rbind(fixef(model_default.n.bi)) %>%
+  rbind(fixef(model.w.n.bi)) %>%
+  as_tibble() %>%
+  mutate(type = c(rep(c("Pooled MD",
+                  "External SD reference model",
+                  "Internal SD reference model",
+                  "Within-study\npooled sample SD model",
+                  "Weighted internal SD reference"), 2),
+                  rep(c("External SD reference model",
+                  "Internal SD reference model",
+                  "Within-study\npooled sample SD model",
+                  "Weighted internal SD reference"), 2)),
+         model = c(rep("Vague priors", 5),
+                   "Priors 5",
+                   rep("Priors 2", 4),
+                   rep("Priors 3", 4),
+                   rep("Priors 4", 4))) %>%
+  mutate(Estimate = case_when(
+    type == "Pooled MD" ~ Estimate,
+    type == "External SD reference model" ~ Estimate * external_sd.bi,
+    type == "Internal SD reference model" ~ Estimate * internal_sd.bi,
+    type == "Within-study\npooled sample SD model" ~ Estimate * internal_sd.bi,
+    type == "Weighted internal SD reference" ~ Estimate * weighted_sd.bi
+  )) %>%
+  mutate(Q2.5 = case_when(
+    type == "Pooled MD" ~ Q2.5,
+    type == "External SD reference model" ~ Q2.5 * external_sd.bi,
+    type == "Internal SD reference model" ~ Q2.5 * internal_sd.bi,
+    type == "Within-study\npooled sample SD model" ~ Q2.5 * internal_sd.bi,
+    type == "Weighted internal SD reference" ~ Q2.5 * weighted_sd.bi
+  )) %>%
+  mutate(Q97.5 = case_when(
+    type == "Pooled MD" ~ Q97.5,
+    type == "External SD reference model" ~ Q97.5 * external_sd.bi,
+    type == "Internal SD reference model" ~ Q97.5 * internal_sd.bi,
+    type == "Within-study\npooled sample SD model" ~ Q97.5 * internal_sd.bi,
+    type == "Weighted internal SD reference" ~ Q97.5 * weighted_sd.bi
+  )) %>%
+  mutate_if(is.numeric, round, 2)
+
+
+# SMDs estimates visualization
+# plot 1
+nice_plot.5 <- ggplot(aes(x = intercept, y = relevel(factor(type), "Pooled MD", after = Inf)), data = smd_data.final.bi %>%
+         mutate(model = factor(model, levels = c("Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors")),
+                type = factor(type, levels = c("Pooled MD",
+                                               "Weighted internal SD reference",
+                                               "External SD reference model",
+                                               "Internal SD reference model",
+                                               "Within-study\npooled sample SD model"),
+                              labels = c("Pooled MD",
+                                         "Method 4",
+                                         "Method 3",
+                                         "Method 2",
+                                         "Method 1")))) +
+  stat_interval(aes(group = model, col = model), position = position_dodge(0.75)) +
+  geom_point(data = numerical.data.smd.final.bi %>%
+               mutate(type = factor(type, levels = c("Pooled MD",
+                                                     "Weighted internal SD reference",
+                                               "External SD reference model",
+                                               "Internal SD reference model",
+                                               "Within-study\npooled sample SD model"),
+                              labels = c("Pooled MD",
+                                         "Method 4",
+                                         "Method 3",
+                                         "Method 2",
+                                         "Method 1")),
+                      model = factor(model, levels = c("Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors"),
+                               labels = c("Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors"))), aes(Estimate, group = model), size = 3,
+             position = position_dodge(0.75)) +
+  geom_vline(xintercept = 0, linetype = 2, size = 0.5) +
+  labs(y = "",
+       x = "Standardised Mean Differences",
+       title = "SMD estimates") +
+  scale_x_continuous(limits = c(-0.5, 1.25),
+                     breaks = seq(-1, 2, .25)) +
+  scale_color_nejm(breaks = c("Vague priors",
+                                                 "Priors 2",
+                                                 "Priors 3",
+                                                 "Priors 4",
+                                                 "Priors 5")) +
+  labs(col = "Prior distributions") +
+  theme_bw()
+
+
+# MD plot
+# plot 1
+nice_plot.6 <- ggplot(aes(x = intercept, y = relevel(factor(type), "Pooled MD", after = Inf)), data = md_data_final.bi %>%
+         mutate(model = factor(model, levels = c("Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors")),
+                type = factor(type, levels = c("Pooled MD",
+                                               "Weighted internal SD reference",
+                                               "External SD reference model",
+                                               "Internal SD reference model",
+                                               "Within-study\npooled sample SD model"),
+                              labels = c("Pooled MD",
+                                         "Method 4",
+                                         "Method 3",
+                                         "Method 2",
+                                         "Method 1")))) +
+  stat_interval(aes(group = model, col = model), position = position_dodge(0.75)) +
+  geom_point(data = numerical.data.final.bi %>%
+               mutate(type = factor(type, levels = c("Pooled MD",
+                                                     "Weighted internal SD reference",
+                                               "External SD reference model",
+                                               "Internal SD reference model",
+                                               "Within-study\npooled sample SD model"),
+                              labels = c("Pooled MD",
+                                         "Method 4",
+                                         "Method 3",
+                                         "Method 2",
+                                         "Method 1")),
+                      model = factor(model, levels = c("Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors"),
+                               labels = c("Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors"))), aes(Estimate, group = model), size = 3,
+             position = position_dodge(0.75)) +
+  geom_vline(xintercept = 0, linetype = 2, size = 1/2) +
+  labs(y = "",
+       x = "Mean Differences",
+       title = "MD estimates") +
+  scale_x_continuous(breaks = seq(-5, 15, 1),
+                     limits = c(-5, 15)) +
+  scale_color_nejm(breaks = c("Vague priors",
+                                                 "Priors 2",
+                                                 "Priors 3",
+                                                 "Priors 4",
+                                                 "Priors 5")) +
+  labs(col = "Prior distributions") +
+  theme_bw()
+
+
+# combining effect estimates plots
+effect_plot.bi <- smd_plot.bi + md_plot.bi
+effect_plot.bi <- (nice_plot.5 + theme(legend.position = "none")) + nice_plot.6
+
+### Between-study SD estimates
+
+# numerical data as SMDs
+het.numerical.data.bi <- brms::posterior_summary(model.bi)[2, ] %>%
+  rbind(posterior_summary(model_ext.bi)[2, ]) %>%
+  rbind(posterior_summary(model_int.bi)[2, ]) %>%
+  rbind(posterior_summary(model_default.bi)[2, ]) %>%
+  rbind(posterior_summary(model.w.bi)[2, ]) %>%
+  rbind(posterior_summary(model.inf.bi)[2, ]) %>%
+  rbind(posterior_summary(model_ext.inf.bi)[2, ]) %>%
+  rbind(posterior_summary(model_int.inf.bi)[2, ]) %>%
+  rbind(posterior_summary(model_default.inf.bi)[2, ]) %>%
+  rbind(posterior_summary(model.w.inf.bi)[2, ]) %>%
+  rbind(posterior_summary(model_ext.r.bi)[2, ]) %>%
+  rbind(posterior_summary(model_int.r.bi)[2, ]) %>%
+  rbind(posterior_summary(model_default.r.bi)[2, ]) %>%
+  rbind(posterior_summary(model.w.r.bi)[2, ]) %>%
+  rbind(posterior_summary(model_ext.n.bi)[2, ]) %>%
+  rbind(posterior_summary(model_int.n.bi)[2, ]) %>%
+  rbind(posterior_summary(model_default.n.bi)[2, ]) %>%
+  rbind(posterior_summary(model.w.n.bi)[2, ]) %>%
+  as_tibble() %>%
+  mutate(type = c(rep(c("Pooled MD",
+                  "External SD reference model",
+                  "Internal SD reference model",
+                  "Within-study\npooled sample SD model",
+                  "Weighted internal SD reference"), 2),
+                  rep(c("External SD reference model",
+                  "Internal SD reference model",
+                  "Within-study\npooled sample SD model",
+                  "Weighted internal SD reference"), 2)),
+         model = c(rep("Vague priors", 5),
+                   "Priors 5",
+                   rep("Priors 2", 4),
+                   rep("Priors 3", 4),
+                   rep("Priors 4", 4))) %>%
+  mutate(Estimate = ifelse(type == "Pooled MD", NA, Estimate)) %>%
+  mutate(Q2.5 = ifelse(type == "Pooled MD", NA, Q2.5)) %>%
+  mutate(Q97.5 = ifelse(type == "Pooled MD", NA, Q97.5)) %>%
+  mutate_if(is.numeric, round, 2)
+
+# rescaled between-study SD 
+het.numerical.data.rescaled.bi <- brms::posterior_summary(model.bi)[2, ] %>%
+  rbind(posterior_summary(model_ext.bi)[2, ]) %>%
+  rbind(posterior_summary(model_int.bi)[2, ]) %>%
+  rbind(posterior_summary(model_default.bi)[2, ]) %>%
+  rbind(posterior_summary(model.w.bi)[2, ]) %>%
+  rbind(posterior_summary(model.inf.bi)[2, ]) %>%
+  rbind(posterior_summary(model_ext.inf.bi)[2, ]) %>%
+  rbind(posterior_summary(model_int.inf.bi)[2, ]) %>%
+  rbind(posterior_summary(model_default.inf.bi)[2, ]) %>%
+  rbind(posterior_summary(model.w.inf.bi)[2, ]) %>%
+  rbind(posterior_summary(model_ext.r.bi)[2, ]) %>%
+  rbind(posterior_summary(model_int.r.bi)[2, ]) %>%
+  rbind(posterior_summary(model_default.r.bi)[2, ]) %>%
+  rbind(posterior_summary(model.w.r.bi)[2, ]) %>%
+  rbind(posterior_summary(model_ext.n.bi)[2, ]) %>%
+  rbind(posterior_summary(model_int.n.bi)[2, ]) %>%
+  rbind(posterior_summary(model_default.n.bi)[2, ]) %>%
+  rbind(posterior_summary(model.w.n.bi)[2, ]) %>%
+  as_tibble() %>%
+  mutate(type = c(rep(c("Pooled MD",
+                  "External SD reference model",
+                  "Internal SD reference model",
+                  "Within-study\npooled sample SD model",
+                  "Weighted internal SD reference"), 2),
+                  rep(c("External SD reference model",
+                  "Internal SD reference model",
+                  "Within-study\npooled sample SD model",
+                  "Weighted internal SD reference"), 2)),
+         model = c(rep("Vague priors", 5),
+                   "Priors 5",
+                   rep("Priors 2", 4),
+                   rep("Priors 3", 4),
+                   rep("Priors 4", 4))) %>%
+  mutate(Estimate = case_when(
+    type == "Pooled MD" ~ Estimate,
+    type == "External SD reference model" ~ Estimate * external_sd.bi,
+    type == "Internal SD reference model" ~ Estimate * internal_sd.bi,
+    type == "Within-study\npooled sample SD model" ~ Estimate * internal_sd.bi,
+    type == "Weighted internal SD reference" ~ Estimate * weighted_sd.bi 
+  )) %>%
+  mutate(Q2.5 = case_when(
+    type == "Pooled MD" ~ Q2.5,
+    type == "External SD reference model" ~ Q2.5 * external_sd.bi,
+    type == "Internal SD reference model" ~ Q2.5 * internal_sd.bi,
+    type == "Within-study\npooled sample SD model" ~ Q2.5 * internal_sd.bi,
+    type == "Weighted internal SD reference" ~ Q2.5 * weighted_sd.bi
+  )) %>%
+  mutate(Q97.5 = case_when(
+    type == "Pooled MD" ~ Q97.5,
+    type == "External SD reference model" ~ Q97.5 * external_sd.bi,
+    type == "Internal SD reference model" ~ Q97.5 * internal_sd.bi,
+    type == "Within-study\npooled sample SD model" ~ Q97.5 * internal_sd.bi,
+    type == "Weighted internal SD reference" ~ Q97.5 * weighted_sd.bi
+  )) %>%
+  mutate_if(is.numeric, round, 2)
+
+
+# smd between-study SD
+# new plot
+nice_plot.7 <- ggplot(aes(x = tau, y = relevel(factor(type), "Pooled MD", after = Inf)), data = smd_data.final.bi %>%
+         mutate(model = factor(model, levels = c("Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors")),
+                type = factor(type, levels = c("Pooled MD",
+                                               "Weighted internal SD reference",
+                                               "External SD reference model",
+                                               "Internal SD reference model",
+                                               "Within-study\npooled sample SD model"),
+                              labels = c("Pooled MD",
+                                         "Method 4",
+                                         "Method 3",
+                                         "Method 2",
+                                         "Method 1")))) +
+  stat_interval(aes(group = model, col = model), position = position_dodge(0.75)) +
+  geom_point(data = het.numerical.data.bi %>%
+               mutate(type = factor(type, levels = c("Pooled MD",
+                                                     "Weighted internal SD reference",
+                                               "External SD reference model",
+                                               "Internal SD reference model",
+                                               "Within-study\npooled sample SD model"),
+                              labels = c("Pooled MD",
+                                         "Method 4",
+                                         "Method 3",
+                                         "Method 2",
+                                         "Method 1")),
+                      model = factor(model, levels = c("Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors"),
+                               labels = c("Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors"))), aes(Estimate, group = model), size = 3,
+             position = position_dodge(0.75)) +
+  labs(y = "",
+       x = expression(paste(tau)),
+       title = "Between-study SD") +
+  scale_x_continuous(limits = c(0, 1.25),
+                     breaks = seq(-1, 2.5, .25)) +
+  scale_color_nejm(breaks = c("Vague priors",
+                                                 "Priors 2",
+                                                 "Priors 3",
+                                                 "Priors 4",
+                                                 "Priors 5")) +
+  labs(col = "Prior distributions") +
+  theme_bw()
+
+# back-conversion visualization
+# new plot
+nice_plot.8 <- ggplot(aes(x = tau, y = relevel(factor(type), "Pooled MD", after = Inf)), data = md_data_final.bi %>%
+         mutate(model = factor(model, levels = c("Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors")),
+                type = factor(type, levels = c("Pooled MD",
+                                               "Weighted internal SD reference",
+                                               "External SD reference model",
+                                               "Internal SD reference model",
+                                               "Within-study\npooled sample SD model"),
+                              labels = c("Pooled MD",
+                                         "Method 4",
+                                         "Method 3",
+                                         "Method 2",
+                                         "Method 1")))) +
+  stat_interval(aes(group = model, col = model), position = position_dodge(0.75)) +
+  geom_point(data = het.numerical.data.rescaled.bi %>%
+               mutate(type = factor(type, levels = c("Pooled MD",
+                                                     "Weighted internal SD reference",
+                                               "External SD reference model",
+                                               "Internal SD reference model",
+                                               "Within-study\npooled sample SD model"),
+                              labels = c("Pooled MD",
+                                         "Method 4",
+                                         "Method 3",
+                                         "Method 2",
+                                         "Method 1")),
+                      model = factor(model, levels = c("Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors"),
+                               labels = c("Priors 5",
+                                                 "Priors 4",
+                                                 "Priors 3",
+                                                 "Priors 2",
+                                                 "Vague priors"))), aes(Estimate, group = model), size = 3,
+             position = position_dodge(0.75)) +
+  labs(y = "",
+       x = expression(paste(tau)),
+       title = "Between-study SD (MD estimates)") +
+  scale_x_continuous(breaks = seq(-1, 20, 1)) +
+  scale_color_nejm(breaks = c("Vague priors",
+                                                 "Priors 2",
+                                                 "Priors 3",
+                                                 "Priors 4",
+                                                 "Priors 5")) +
+  labs(col = "Prior distributions") +
+  theme_bw()
+
+
+# combining plots
+het.plot.bi <- plot_sppb_het.smd.bi + plot_sppb_het.bi
+
+
+# plot!
+ggpubr::ggarrange(nice_plot.5, nice_plot.6, nice_plot.7, nice_plot.8, 
+                  nrow = 2, ncol = 2, common.legend = TRUE, legend = "bottom")
+```
+
+
+### Visualization of the contribution of each data point to the calculation of internal SD references
+
+We calculated the weights of each study in the meta-analysis and we plotted them against the pooled SDs.
+
+```{r}
+### SPPB data
+# weights calculation
+sppb_data <- sppb_data %>%
+  mutate(weights = 1 / se_diff ^ 2)
+
+# plot
+sppb_data %>%
+  ggplot(aes(x = pre_sd_pooled, y = weights)) +
+  geom_vline(xintercept = sppb_internal_sd, col = "blue", size = 1, linetype = 2) +
+  geom_vline(xintercept = sppb_weighted_ref, col = "orange", size = 1, linetype = 2) +
+  geom_point(aes(size = weights)) +
+  ggrepel::geom_label_repel(aes(label = studyID)) +
+  labs(x = "Calculated pooled SD",
+       y = "Meta-analysis weights") +
+  theme_tidybayes() +
+  panel_border() +
+  scale_x_continuous(breaks = c(1.5, sppb_weighted_ref, 1.75, 2, 2.25, sppb_internal_sd, 2.5, 2.75),
+                     labels = c(1.5, "Weighted\ninternal SD reference", 1.75, 2, 2.25, "NICE\n internal SD reference", 2.5, 2.75)) +
+  theme(legend.position = "none")
+
+
+### BI data
+# weights calculation
+bi_data <- bi_data %>%
+  mutate(weights = 1 / se_diff ^ 2)
+
+# plot
+bi_data %>%
+  ggplot(aes(x = pre_sd_pooled, y = weights)) +
+  geom_vline(xintercept = internal_sd.bi, col = "blue", size = 1, linetype = 2) +
+  geom_vline(xintercept = weighted.mean(bi_data$pre_sd_pooled, bi_data$weights), col = "orange", size = 1, linetype = 2) +
+  geom_point(aes(size = weights)) +
+  ggrepel::geom_label_repel(aes(label = studyID)) +
+  labs(x = "Calculated pooled SD",
+       y = "Meta-analysis weights") +
+  theme_tidybayes() +
+  panel_border() +
+  scale_x_continuous(breaks = c(10, 12, weighted.mean(bi_data$pre_sd_pooled, bi_data$weights), internal_sd.bi, 18, 20, 22, 24),
+                     labels = c(10, 12, "Weighted\ninternal\nSD reference", "NICE internal\nSD reference", 18, 20, 22, 24)) +
+  theme(legend.position = "none")
+```
+
+
+### Sensitivity analysis: Frequentist approach
+
+```{r}
+## SPPB data
+# Mean differences
+m.gen.sppb.DL.MD <- metagen(TE = diff, 
+                 seTE = se_diff, 
+                 studlab = studyID, 
+                 data = sppb_data, 
+                 sm = "MD", 
+                 fixed = FALSE, 
+                 random = TRUE,
+                 method.tau = "DL", # DerSimonian-Laird estimator
+                 hakn = TRUE, 
+                 title = "Meta-methodological work")
+summary(m.gen.sppb.DL.MD)
+m.gen.sppb.REML.MD <- metagen(TE = diff, 
+                 seTE = se_diff, 
+                 studlab = studyID, 
+                 data = sppb_data, 
+                 sm = "MD", 
+                 fixed = FALSE, 
+                 random = TRUE,
+                 method.tau = "REML", # Restricted Maximum Likelihood estimator
+                 hakn = TRUE, 
+                 title = "Meta-methodological work")
+
+# SMDs using an external SD reference
+m.gen.sppb.DL.ext <- metagen(TE = diff_ext, 
+                 seTE = se_diff_ext, 
+                 studlab = studyID, 
+                 data = sppb_data, 
+                 sm = "SMD", 
+                 fixed = FALSE, 
+                 random = TRUE,
+                 method.tau = "DL", 
+                 hakn = TRUE, 
+                 title = "Meta-methodological work")
+summary(m.gen.sppb.DL.ext)
+m.gen.sppb.REML.ext <- metagen(TE = diff_ext, 
+                 seTE = se_diff_ext, 
+                 studlab = studyID, 
+                 data = sppb_data, 
+                 sm = "SMD", 
+                 fixed = FALSE, 
+                 random = TRUE,
+                 method.tau = "REML", 
+                 hakn = TRUE, 
+                 title = "Meta-methodological work")
+
+# SMDs using a calculated pooled internal SD reference
+m.gen.sppb.DL.int <- metagen(TE = diff_int, 
+                 seTE = se_diff_int, 
+                 studlab = studyID, 
+                 data = sppb_data, 
+                 sm = "SMD", 
+                 fixed = FALSE, 
+                 random = TRUE,
+                 method.tau = "DL", 
+                 hakn = TRUE, 
+                 title = "Meta-methodological work")
+summary(m.gen.sppb.DL.int)
+m.gen.sppb.REML.int <- metagen(TE = diff_int, 
+                 seTE = se_diff_int, 
+                 studlab = studyID, 
+                 data = sppb_data, 
+                 sm = "SMD", 
+                 fixed = FALSE, 
+                 random = TRUE,
+                 method.tau = "REML", 
+                 hakn = TRUE, 
+                 title = "Meta-methodological work")
+
+# SMDs using an internal SD reference at baseline
+m.gen.sppb.DL.pre <- metagen(TE = diff_pre, 
+                 seTE = se_diff_pre, 
+                 studlab = studyID, 
+                 data = sppb_data, 
+                 sm = "SMD", 
+                 fixed = FALSE, 
+                 random = TRUE,
+                 method.tau = "DL", 
+                 hakn = TRUE, 
+                 title = "Meta-methodological work")
+summary(m.gen.sppb.DL.pre)
+m.gen.sppb.REML.pre <- metagen(TE = diff_pre, 
+                 seTE = se_diff_pre, 
+                 studlab = studyID, 
+                 data = sppb_data, 
+                 sm = "SMD", 
+                 fixed = FALSE, 
+                 random = TRUE,
+                 method.tau = "REML", 
+                 hakn = TRUE, 
+                 title = "Meta-methodological work")
+
+# SMDs using an internal SD reference at post-intervention
+m.gen.sppb.DL.post <- metagen(TE = diff_post, 
+                 seTE = se_diff_post, 
+                 studlab = studyID, 
+                 data = sppb_data, 
+                 sm = "SMD", 
+                 fixed = FALSE, 
+                 random = TRUE,
+                 method.tau = "DL", 
+                 hakn = TRUE, 
+                 title = "Meta-methodological work")
+summary(m.gen.sppb.DL.post)
+m.gen.sppb.REML.post <- metagen(TE = diff_post, 
+                 seTE = se_diff_post, 
+                 studlab = studyID, 
+                 data = sppb_data, 
+                 sm = "SMD", 
+                 fixed = FALSE, 
+                 random = TRUE,
+                 method.tau = "REML", 
+                 hakn = TRUE, 
+                 title = "Meta-methodological work")
+
+sppb.metadata <- data.frame(model = rep(c("Study-specific pooled SD\n(at post-intervention)",
+                         "Study-specific pooled SD\n(at pre-intervention)",
+                         "Internal SD",
+                         "External SD"), times = 2),
+           estimator = rep(c("DerSimonian-Laird",
+                             "Restricted Maximum Likelihood"), each = 4),
+           estimate = c(m.gen.sppb.DL.post$TE.random,
+                        m.gen.sppb.DL.pre$TE.random,
+                        m.gen.sppb.DL.int$TE.random,
+                        m.gen.sppb.DL.ext$TE.random,
+                        m.gen.sppb.REML.post$TE.random,
+                        m.gen.sppb.REML.pre$TE.random,
+                        m.gen.sppb.REML.int$TE.random,
+                        m.gen.sppb.REML.ext$TE.random),
+           lower = c(m.gen.sppb.DL.post$lower.random,
+                        m.gen.sppb.DL.pre$lower.random,
+                        m.gen.sppb.DL.int$lower.random,
+                        m.gen.sppb.DL.ext$lower.random,
+                        m.gen.sppb.REML.post$lower.random,
+                        m.gen.sppb.REML.pre$lower.random,
+                        m.gen.sppb.REML.int$lower.random,
+                        m.gen.sppb.REML.ext$lower.random),
+           upper = c(m.gen.sppb.DL.post$upper.random,
+                        m.gen.sppb.DL.pre$upper.random,
+                        m.gen.sppb.DL.int$upper.random,
+                        m.gen.sppb.DL.ext$upper.random,
+                        m.gen.sppb.REML.post$upper.random,
+                        m.gen.sppb.REML.pre$upper.random,
+                        m.gen.sppb.REML.int$upper.random,
+                        m.gen.sppb.REML.ext$upper.random),
+           tau = c(m.gen.sppb.DL.post$tau,
+                        m.gen.sppb.DL.pre$tau,
+                        m.gen.sppb.DL.int$tau,
+                        m.gen.sppb.DL.ext$tau,
+                        m.gen.sppb.REML.post$tau,
+                        m.gen.sppb.REML.pre$tau,
+                        m.gen.sppb.REML.int$tau,
+                        m.gen.sppb.REML.ext$tau),
+           lower.tau = c(m.gen.sppb.DL.post$lower.tau,
+                        m.gen.sppb.DL.pre$lower.tau,
+                        m.gen.sppb.DL.int$lower.tau,
+                        m.gen.sppb.DL.ext$lower.tau,
+                        m.gen.sppb.REML.post$lower.tau,
+                        m.gen.sppb.REML.pre$lower.tau,
+                        m.gen.sppb.REML.int$lower.tau,
+                        m.gen.sppb.REML.ext$lower.tau),
+           upper.tau = c(m.gen.sppb.DL.post$upper.tau,
+                        m.gen.sppb.DL.pre$upper.tau,
+                        m.gen.sppb.DL.int$upper.tau,
+                        m.gen.sppb.DL.ext$upper.tau,
+                        m.gen.sppb.REML.post$upper.tau,
+                        m.gen.sppb.REML.pre$upper.tau,
+                        m.gen.sppb.REML.int$upper.tau,
+                        m.gen.sppb.REML.ext$upper.tau))
+
+# plot
+## relative effect estimates
+tiff("effects_freq.tiff", width = 9, height = 7, res = 300, units = "in")
+sppb.metadata %>%
+  ggplot(aes(x = estimate, y = model, group = estimator, col = estimator)) +
+  geom_pointrange(aes(xmin = lower,
+                      xmax = upper),
+                  position = position_dodge(width = 0.5)) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  labs(x = "Relative effect estimates (SMD)",
+       y = element_blank(),
+       col = "Between-study heterogeneity estimator") +
+  theme_bw() +
+  scale_color_lancet() +
+  theme(legend.position = "bottom")
+dev.off()
+
+## between-study heterogeneity (tau; SD)
+tiff("sppb_tau_freq.tiff", width = 9, height = 7, res = 300, units = "in")
+sppb.metadata %>%
+  ggplot(aes(x = tau, y = model, group = estimator, col = estimator)) +
+  geom_pointrange(aes(xmin = lower.tau,
+                      xmax = upper.tau),
+                  position = position_dodge(width = 0.5)) +
+  labs(x = expression(paste(tau, " estimates (SMD)")),
+       y = element_blank(),
+       col = "Between-study heterogeneity estimator") +
+  theme_bw() +
+  scale_color_lancet() +
+  theme(legend.position = "bottom")
+dev.off()
+
+
+## Barthel Index data
+# Mean differences
+m.gen.bi.DL.MD <- metagen(TE = diff, 
+                 seTE = se_diff, 
+                 studlab = studyID, 
+                 data = bi_data, 
+                 sm = "MD", 
+                 fixed = FALSE, 
+                 random = TRUE,
+                 method.tau = "DL", 
+                 hakn = TRUE, 
+                 title = "Meta-methodological work")
+summary(m.gen.bi.DL.MD)
+m.gen.bi.REML.MD <- metagen(TE = diff, 
+                 seTE = se_diff, 
+                 studlab = studyID, 
+                 data = bi_data, 
+                 sm = "MD", 
+                 fixed = FALSE, 
+                 random = TRUE,
+                 method.tau = "REML", 
+                 hakn = TRUE, 
+                 title = "Meta-methodological work")
+
+# SMDs using an external SD reference
+m.gen.bi.DL.ext <- metagen(TE = diff_ext, 
+                 seTE = se_diff_ext, 
+                 studlab = studyID, 
+                 data = bi_data, 
+                 sm = "SMD", 
+                 fixed = FALSE, 
+                 random = TRUE,
+                 method.tau = "DL", 
+                 hakn = TRUE, 
+                 title = "Meta-methodological work")
+summary(m.gen.bi.DL.ext)
+m.gen.bi.REML.ext <- metagen(TE = diff_ext, 
+                 seTE = se_diff_ext, 
+                 studlab = studyID, 
+                 data = bi_data, 
+                 sm = "SMD", 
+                 fixed = FALSE, 
+                 random = TRUE,
+                 method.tau = "REML", 
+                 hakn = TRUE, 
+                 title = "Meta-methodological work")
+
+# SMDs using a calculated pooled internal SD reference
+m.gen.bi.DL.int <- metagen(TE = diff_int, 
+                 seTE = se_diff_int, 
+                 studlab = studyID, 
+                 data = bi_data, 
+                 sm = "SMD", 
+                 fixed = FALSE, 
+                 random = TRUE,
+                 method.tau = "DL", 
+                 hakn = TRUE, 
+                 title = "Meta-methodological work")
+summary(m.gen.bi.DL.int)
+m.gen.bi.REML.int <- metagen(TE = diff_int, 
+                 seTE = se_diff_int, 
+                 studlab = studyID, 
+                 data = bi_data, 
+                 sm = "SMD", 
+                 fixed = FALSE, 
+                 random = TRUE,
+                 method.tau = "REML", 
+                 hakn = TRUE, 
+                 title = "Meta-methodological work")
+
+# SMDs using an internal SD reference at baseline
+m.gen.bi.DL.pre <- metagen(TE = diff_pre, 
+                 seTE = se_diff_pre, 
+                 studlab = studyID, 
+                 data = bi_data, 
+                 sm = "SMD", 
+                 fixed = FALSE, 
+                 random = TRUE,
+                 method.tau = "DL", 
+                 hakn = TRUE, 
+                 title = "Meta-methodological work")
+summary(m.gen.bi.DL.pre)
+m.gen.bi.REML.pre <- metagen(TE = diff_pre, 
+                 seTE = se_diff_pre, 
+                 studlab = studyID, 
+                 data = bi_data, 
+                 sm = "SMD", 
+                 fixed = FALSE, 
+                 random = TRUE,
+                 method.tau = "REML", 
+                 hakn = TRUE, 
+                 title = "Meta-methodological work")
+
+# SMDs using an internal SD reference at post-intervention
+m.gen.bi.DL.post <- metagen(TE = diff_post, 
+                 seTE = se_diff_post, 
+                 studlab = studyID, 
+                 data = bi_data, 
+                 sm = "SMD", 
+                 fixed = FALSE, 
+                 random = TRUE,
+                 method.tau = "DL", 
+                 hakn = TRUE, 
+                 title = "Meta-methodological work")
+summary(m.gen.bi.DL.post)
+m.gen.bi.REML.post <- metagen(TE = diff_post, 
+                 seTE = se_diff_post, 
+                 studlab = studyID, 
+                 data = bi_data, 
+                 sm = "SMD", 
+                 fixed = FALSE, 
+                 random = TRUE,
+                 method.tau = "REML", 
+                 hakn = TRUE, 
+                 title = "Meta-methodological work")
+
+# Data storage
+bi.metadata <- data.frame(model = rep(c("Study-specific pooled SD\n(at post-intervention)",
+                         "Study-specific pooled SD\n(at pre-intervention)",
+                         "Internal SD",
+                         "External SD"), times = 2),
+           estimator = rep(c("DerSimonian-Laird",
+                             "Restricted Maximum Likelihood"), each = 4),
+           estimate = c(m.gen.bi.DL.post$TE.random,
+                        m.gen.bi.DL.pre$TE.random,
+                        m.gen.bi.DL.int$TE.random,
+                        m.gen.bi.DL.ext$TE.random,
+                        m.gen.bi.REML.post$TE.random,
+                        m.gen.bi.REML.pre$TE.random,
+                        m.gen.bi.REML.int$TE.random,
+                        m.gen.bi.REML.ext$TE.random),
+           lower = c(m.gen.bi.DL.post$lower.random,
+                        m.gen.bi.DL.pre$lower.random,
+                        m.gen.bi.DL.int$lower.random,
+                        m.gen.bi.DL.ext$lower.random,
+                        m.gen.bi.REML.post$lower.random,
+                        m.gen.bi.REML.pre$lower.random,
+                        m.gen.bi.REML.int$lower.random,
+                        m.gen.bi.REML.ext$lower.random),
+           upper = c(m.gen.bi.DL.post$upper.random,
+                        m.gen.bi.DL.pre$upper.random,
+                        m.gen.bi.DL.int$upper.random,
+                        m.gen.bi.DL.ext$upper.random,
+                        m.gen.bi.REML.post$upper.random,
+                        m.gen.bi.REML.pre$upper.random,
+                        m.gen.bi.REML.int$upper.random,
+                        m.gen.bi.REML.ext$upper.random),
+           tau = c(m.gen.bi.DL.post$tau,
+                        m.gen.bi.DL.pre$tau,
+                        m.gen.bi.DL.int$tau,
+                        m.gen.bi.DL.ext$tau,
+                        m.gen.bi.REML.post$tau,
+                        m.gen.bi.REML.pre$tau,
+                        m.gen.bi.REML.int$tau,
+                        m.gen.bi.REML.ext$tau),
+           lower.tau = c(m.gen.bi.DL.post$lower.tau,
+                        m.gen.bi.DL.pre$lower.tau,
+                        m.gen.bi.DL.int$lower.tau,
+                        m.gen.bi.DL.ext$lower.tau,
+                        m.gen.bi.REML.post$lower.tau,
+                        m.gen.bi.REML.pre$lower.tau,
+                        m.gen.bi.REML.int$lower.tau,
+                        m.gen.bi.REML.ext$lower.tau),
+           upper.tau = c(m.gen.bi.DL.post$upper.tau,
+                        m.gen.bi.DL.pre$upper.tau,
+                        m.gen.bi.DL.int$upper.tau,
+                        m.gen.bi.DL.ext$upper.tau,
+                        m.gen.bi.REML.post$upper.tau,
+                        m.gen.bi.REML.pre$upper.tau,
+                        m.gen.bi.REML.int$upper.tau,
+                        m.gen.bi.REML.ext$upper.tau))
+
+# plot
+## relative effect estimates
+bi.metadata %>%
+  ggplot(aes(x = estimate, y = model, group = estimator, col = estimator)) +
+  geom_pointrange(aes(xmin = lower,
+                      xmax = upper),
+                  position = position_dodge(width = 0.5)) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  labs(x = "Relative effect estimates (SMD)",
+       y = element_blank(),
+       col = "Between-study heterogeneity estimator") +
+  theme_bw() +
+  scale_color_lancet() +
+  theme(legend.position = "bottom")
+
+## between-study heterogeneity (tau; SD)
+bi.metadata %>%
+  ggplot(aes(x = tau, y = model, group = estimator, col = estimator)) +
+  geom_pointrange(aes(xmin = lower.tau,
+                      xmax = upper.tau),
+                  position = position_dodge(width = 0.5)) +
+  labs(x = expression(paste(tau, " estimates (SMD)")),
+       y = element_blank(),
+       col = "Between-study heterogeneity estimator") +
+  theme_bw() +
+  scale_color_lancet() +
+  theme(legend.position = "bottom")
+
+
+### Re-expression methods
+
+## SPPB
+## Method 1: using the same SD reference for standardization
+# adding "Pooled MD" results
+sppb.metadata[9, ] <- c("Pooled MD", "DerSimonian-Laird", m.gen.sppb.DL.MD$TE.random, m.gen.sppb.DL.MD$lower.random, m.gen.sppb.DL.MD$upper.random, m.gen.sppb.DL.MD$tau,
+                        m.gen.sppb.DL.MD$lower.tau, m.gen.sppb.DL.MD$upper.tau)
+sppb.metadata[10, ] <- c("Pooled MD", "Restricted Maximum Likelihood", m.gen.sppb.REML.MD$TE.random, m.gen.sppb.REML.MD$lower.random, m.gen.sppb.REML.MD$upper.random, m.gen.sppb.REML.MD$tau,
+                        m.gen.sppb.REML.MD$lower.tau, m.gen.sppb.REML.MD$upper.tau)
+
+
+# re-expressing meta-analysis results
+sppb.metadata <- sppb.metadata %>%
+  mutate(estimate = as.numeric(estimate),
+         lower = as.numeric(lower),
+         upper = as.numeric(upper),
+         tau = as.numeric(tau),
+         lower.tau = as.numeric(lower.tau),
+         upper.tau = as.numeric(upper.tau)) %>%
+  # re-expressing SMD estimates
+  mutate(estimate_re = case_when(
+    model %in% c("Study-specific pooled SD\n(at pre-intervention)",
+                 "Study-specific pooled SD\n(at post-intervention)") ~ estimate * sppb_external_sd,
+    model == "Internal SD" ~ estimate * sppb_external_sd,
+    model == "External SD" ~ estimate * sppb_external_sd,
+    model == "Pooled MD" ~ estimate),
+    # re-expressing lower bounds
+    lower_re = case_when(
+    model %in% c("Study-specific pooled SD\n(at pre-intervention)",
+                 "Study-specific pooled SD\n(at post-intervention)") ~ lower * sppb_external_sd,
+    model == "Internal SD" ~ lower * sppb_external_sd,
+    model == "External SD" ~ lower * sppb_external_sd,
+    model == "Pooled MD" ~ lower),
+    # re-expressing upper bounds
+    upper_re = case_when(
+    model %in% c("Study-specific pooled SD\n(at pre-intervention)",
+                 "Study-specific pooled SD\n(at post-intervention)") ~ upper * sppb_external_sd,
+    model == "Internal SD" ~ upper * sppb_external_sd,
+    model == "External SD" ~ upper * sppb_external_sd,
+    model == "Pooled MD" ~ upper),
+    # re-expressing tau estimates
+    tau_re = case_when(
+    model %in% c("Study-specific pooled SD\n(at pre-intervention)",
+                 "Study-specific pooled SD\n(at post-intervention)") ~ tau * sppb_external_sd,
+    model == "Internal SD" ~ tau * sppb_external_sd,
+    model == "External SD" ~ tau * sppb_external_sd,
+    model == "Pooled MD" ~ tau),
+    # re-expressing tau lower bounds
+    lower.tau_re = case_when(
+    model %in% c("Study-specific pooled SD\n(at pre-intervention)",
+                 "Study-specific pooled SD\n(at post-intervention)") ~ lower.tau * sppb_external_sd,
+    model == "Internal SD" ~ lower.tau * sppb_external_sd,
+    model == "External SD" ~ lower.tau * sppb_external_sd,
+    model == "Pooled MD" ~ lower.tau),
+    # re-expressing tau upper bounds
+    upper.tau_re = case_when(
+    model %in% c("Study-specific pooled SD\n(at pre-intervention)",
+                 "Study-specific pooled SD\n(at post-intervention)") ~ upper.tau * sppb_external_sd,
+    model == "Internal SD" ~ upper.tau * sppb_external_sd,
+    model == "External SD" ~ upper.tau * sppb_external_sd,
+    model == "Pooled MD" ~ upper.tau))
+
+
+# plotting
+## relative effect estimates
+plot.1 <- sppb.metadata %>%
+  mutate(model = factor(model,
+                        levels = c("Pooled MD",
+                                   "External SD",
+                                   "Internal SD",
+                                   "Study-specific pooled SD\n(at pre-intervention)",
+                                   "Study-specific pooled SD\n(at post-intervention)"))) %>%
+  ggplot(aes(x = estimate_re, y = model, group = estimator, col = estimator)) +
+  geom_pointrange(aes(xmin = lower_re,
+                      xmax = upper_re),
+                  position = position_dodge(width = 0.5)) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  labs(x = "Relative effect estimates (MD)",
+       y = element_blank(),
+       col = "Between-study heterogeneity estimator") +
+  theme_bw() +
+  scale_color_lancet() +
+  theme(legend.position = "bottom")
+
+## tau estimates
+plot.2 <- sppb.metadata %>%
+  mutate(model = factor(model,
+                        levels = c("Pooled MD",
+                                   "External SD",
+                                   "Internal SD",
+                                   "Study-specific pooled SD\n(at pre-intervention)",
+                                   "Study-specific pooled SD\n(at post-intervention)"))) %>%
+  ggplot(aes(x = tau_re, y = model, group = estimator, col = estimator)) +
+  geom_pointrange(aes(xmin = lower.tau_re,
+                      xmax = upper.tau_re),
+                  position = position_dodge(width = 0.5)) +
+  labs(x = expression(paste(tau, " estimates (MD)")),
+       y = element_blank(),
+       col = "Between-study heterogeneity estimator") +
+  theme_bw() +
+  scale_color_lancet() +
+  theme(legend.position = "bottom")
+
+# combining plots
+ggpubr::ggarrange(plot.1, plot.2, 
+                  ncol = 1, 
+                  common.legend = TRUE,
+                  legend = "bottom")
+
+
+
+## Barthel Index
+## Method 1: using the same SD reference for standardization
+# adding "Pooled MD" results
+bi.metadata[9, ] <- c("Pooled MD", "DerSimonian-Laird", m.gen.bi.DL.MD$TE.random, m.gen.bi.DL.MD$lower.random, m.gen.bi.DL.MD$upper.random, m.gen.bi.DL.MD$tau,
+                        m.gen.bi.DL.MD$lower.tau, m.gen.bi.DL.MD$upper.tau)
+bi.metadata[10, ] <- c("Pooled MD", "Restricted Maximum Likelihood", m.gen.bi.REML.MD$TE.random, m.gen.bi.REML.MD$lower.random, m.gen.bi.REML.MD$upper.random, m.gen.bi.REML.MD$tau,
+                        m.gen.bi.REML.MD$lower.tau, m.gen.bi.REML.MD$upper.tau)
+
+
+# re-expressing meta-analysis results
+bi.metadata <- bi.metadata %>%
+  mutate(estimate = as.numeric(estimate),
+         lower = as.numeric(lower),
+         upper = as.numeric(upper),
+         tau = as.numeric(tau),
+         lower.tau = as.numeric(lower.tau),
+         upper.tau = as.numeric(upper.tau)) %>%
+  # re-expressing SMD estimates
+  mutate(estimate_re = case_when(
+    model %in% c("Study-specific pooled SD\n(at pre-intervention)",
+                 "Study-specific pooled SD\n(at post-intervention)") ~ estimate * external_sd.bi,
+    model == "Internal SD" ~ estimate * external_sd.bi,
+    model == "External SD" ~ estimate * external_sd.bi,
+    model == "Pooled MD" ~ estimate),
+    # re-expressing lower bounds
+    lower_re = case_when(
+    model %in% c("Study-specific pooled SD\n(at pre-intervention)",
+                 "Study-specific pooled SD\n(at post-intervention)") ~ lower * external_sd.bi,
+    model == "Internal SD" ~ lower * external_sd.bi,
+    model == "External SD" ~ lower * external_sd.bi,
+    model == "Pooled MD" ~ lower),
+    # re-expressing upper bounds
+    upper_re = case_when(
+    model %in% c("Study-specific pooled SD\n(at pre-intervention)",
+                 "Study-specific pooled SD\n(at post-intervention)") ~ upper * external_sd.bi,
+    model == "Internal SD" ~ upper * external_sd.bi,
+    model == "External SD" ~ upper * external_sd.bi,
+    model == "Pooled MD" ~ upper),
+    # re-expressing tau estimates
+    tau_re = case_when(
+    model %in% c("Study-specific pooled SD\n(at pre-intervention)",
+                 "Study-specific pooled SD\n(at post-intervention)") ~ tau * external_sd.bi,
+    model == "Internal SD" ~ tau * external_sd.bi,
+    model == "External SD" ~ tau * external_sd.bi,
+    model == "Pooled MD" ~ tau),
+    # re-expressing tau lower bounds
+    lower.tau_re = case_when(
+    model %in% c("Study-specific pooled SD\n(at pre-intervention)",
+                 "Study-specific pooled SD\n(at post-intervention)") ~ lower.tau * external_sd.bi,
+    model == "Internal SD" ~ lower.tau * external_sd.bi,
+    model == "External SD" ~ lower.tau * external_sd.bi,
+    model == "Pooled MD" ~ lower.tau),
+    # re-expressing tau upper bounds
+    upper.tau_re = case_when(
+    model %in% c("Study-specific pooled SD\n(at pre-intervention)",
+                 "Study-specific pooled SD\n(at post-intervention)") ~ upper.tau * external_sd.bi,
+    model == "Internal SD" ~ upper.tau * external_sd.bi,
+    model == "External SD" ~ upper.tau * external_sd.bi,
+    model == "Pooled MD" ~ upper.tau))
+
+
+# plotting
+## relative effect estimates
+plot.1 <- bi.metadata %>%
+  mutate(model = factor(model,
+                        levels = c("Pooled MD",
+                                   "External SD",
+                                   "Internal SD",
+                                   "Study-specific pooled SD\n(at pre-intervention)",
+                                   "Study-specific pooled SD\n(at post-intervention)"))) %>%
+  ggplot(aes(x = estimate_re, y = model, group = estimator, col = estimator)) +
+  geom_pointrange(aes(xmin = lower_re,
+                      xmax = upper_re),
+                  position = position_dodge(width = 0.5)) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  labs(x = "Relative effect estimates (MD)",
+       y = element_blank(),
+       col = "Between-study heterogeneity estimator") +
+  theme_bw() +
+  scale_color_lancet() +
+  theme(legend.position = "bottom")
+
+## tau estimates
+plot.2 <- bi.metadata %>%
+  mutate(model = factor(model,
+                        levels = c("Pooled MD",
+                                   "External SD",
+                                   "Internal SD",
+                                   "Study-specific pooled SD\n(at pre-intervention)",
+                                   "Study-specific pooled SD\n(at post-intervention)"))) %>%
+  ggplot(aes(x = tau_re, y = model, group = estimator, col = estimator)) +
+  geom_pointrange(aes(xmin = lower.tau_re,
+                      xmax = upper.tau_re),
+                  position = position_dodge(width = 0.5)) +
+  labs(x = expression(paste(tau, " estimates (MD)")),
+       y = element_blank(),
+       col = "Between-study heterogeneity estimator") +
+  theme_bw() +
+  scale_color_lancet() +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+sessionInfo()
+```
+
