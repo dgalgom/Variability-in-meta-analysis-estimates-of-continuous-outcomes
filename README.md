@@ -2,7 +2,7 @@
 This repository is part of the methodological work in evidence synthesis developed in the **Centre for Reviews and Dissemination** (CRD; University of York) and the **Bristol Medical School** (University of Bristol). It investigates the variability in meta-analysis estimates of continuous outcomes using different standardization and re-expression methods.
 
 ## Study analysing different standardization methods and how to re-express those estimates using scale-specific re-expression methods
-Our work entitled "*Variability in meta-analysis estimates of continouous outcomes using different standardization and scale-specific re-expression methods*" tried to clarify (1) the impact of using different data standardization and scale-specific re-expression methods in meta-analyses using standardized mean differences (*SMDs*), and (2) to give some recommendations to promote methodological guide and transparency in meta-analyses.
+Our work entitled "*Variability in meta-analysis estimates of continouous outcomes using different standardization and scale-specific re-expression methods*" tried to clarify (1) the impact of using different data standardization and scale-specific re-expression methods in meta-analyses using standardized mean differences (*SMDs*), and (2) to give some recommendations to promote methodological guide and transparency in meta-analyses. The full text is available in: https://www.jclinepi.com/article/S0895-4356(23)00297-4/pdf.
 
 ### When you import the dataset in your environment... 
 You may need some clarification on the meaning of the variables. Let's crumble our dataset:
